@@ -1,0 +1,41 @@
+[package]
+name = "stamp"
+version = "0.1.0"
+edition = "2021"
+description = "RFC3161 timestamping tool for any file"
+authors = ["Dr. Samuel Louviot, Ph.D <tech.swerve263@slmail.me>"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/samuel/StampTime"
+
+[[bin]]
+name = "stamp"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Cryptographic dependencies
+ring = { workspace = true }
+reqwest = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+
+# File handling
+walkdir = { workspace = true }
+tempfile = { workspace = true }
+
+# Additional dependencies
+uuid = { workspace = true }
+chrono = { workspace = true }
+toml = { workspace = true }
+ctrlc = "3.4"
+
+# Local dependencies - none (file-agnostic implementation)

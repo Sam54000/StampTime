@@ -1,0 +1,14 @@
+[tsa]
+url = "http://timestamp.digicert.com"
+
+[certificates]
+sha256_responder = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertSHA256RSA4096TimestampResponder20251.cer"
+sha384_responder = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertSHA384RSA4096TimestampResponder20251.cer"
+sha512_responder = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertSHA512RSA4096TimestampResponder20251.cer"
+intermediate = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertTrustedG4TimeStampingRSA4096SHA2562025CA1.pem"
+root = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertTrustedRootG4.cer"
+
+[path]
+base = "/Users/samuel/Desktop/certifications"
+chain_dir = "LeChain"
+chain_filename = "chain.pem"
