@@ -441,3 +441,7 @@ stamp keygen pkcs12 --help
 stamp cert --help
 stamp verify --help
 ```
+
+# Future Implementation
+- Batch Verify
+- Try with other TSA

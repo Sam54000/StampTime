@@ -22,6 +22,9 @@ use std::path::PathBuf;
 use std::io::Write;
 use tracing::{info, warn};
 use walkdir::WalkDir;
+use colored::*;
+
+/// Custom logging functions for file processing
 
 #[derive(Debug, Clone)]
 pub struct TimestampConfig {
@@ -673,46 +676,255 @@ pub fn process_directory_batch(
     no_verify: bool,
     recursive: bool,
     dry_run: bool,
+    re_timestamp: bool,
+    use_git: bool,
+    verbose: bool,
+    cleanup: bool,
     result: &mut BatchResult,
 ) -> AnyhowResult<()> {
-    let walker = if recursive {
-        WalkDir::new(input_dir).into_iter()
-    } else {
-        WalkDir::new(input_dir).max_depth(1).into_iter()
-    };
+    // Clean up orphaned timestamp files if requested (only with git)
+    if cleanup && !use_git {
+        return Err(anyhow::anyhow!("Cleanup option requires --use-git flag. Git provides reliable change detection needed for timestamp synchronization."));
+    }
     
-    for entry in walker {
-        let entry = entry?;
-        let path = entry.path();
+    if use_git {
+        // Git-based workflow
+        let input_dir_abs = input_dir.canonicalize()
+            .with_context(|| format!("Cannot canonicalize input directory: {}", input_dir.display()))?;
+        let parent_dir = input_dir_abs.parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory of input directory"))?;
         
-        if path.is_dir() {
-            continue;
+        
+        // Ensure git repository exists
+        ensure_git_repository(parent_dir)?;
+        
+        // Get changed, untracked, and deleted files
+        let changed_files = get_git_changed_files(&input_dir_abs, parent_dir)?;
+        let untracked_files = get_git_untracked_files(&input_dir_abs, parent_dir)?;
+        
+        // Clean up timestamps for deleted files if cleanup is requested
+        if cleanup {
+            let deleted_files = get_git_deleted_files(&input_dir_abs, parent_dir)?;
+            cleanup_deleted_file_timestamps(&deleted_files, output_dir, verbose)?;
         }
         
-        if should_skip_file(path) {
-            continue;
-        }
+        let files_to_process: Vec<_> = changed_files.clone().into_iter()
+            .chain(untracked_files.clone().into_iter())
+            .collect();
         
-        result.total_files += 1;
-        
-        if has_timestamp(path, output_dir) {
-            println!("Skipping {} (already timestamped)", path.display());
-            result.add_skipped();
-            continue;
-        }
-        
-        if dry_run {
-            println!("Would process: {}", path.display());
-            result.add_processed();
-        } else {
-            match process_single_file_batch(path, output_dir, tsa_url, tsa_cert_path, no_verify) {
-                Ok(_) => {
-                    println!("Processed: {}", path.display());
-                    result.add_processed();
+        // Count total files in source directory for accurate reporting
+        let total_files = if recursive {
+            WalkDir::new(input_dir).into_iter().filter(|entry| {
+                if let Ok(entry) = entry {
+                    entry.path().is_file() && !should_skip_file(entry.path())
+                } else {
+                    false
                 }
-                Err(e) => {
-                    eprintln!("Failed to process {}: {}", path.display(), e);
-                    result.add_failed(format!("{}: {}", path.display(), e));
+            }).count()
+        } else {
+            WalkDir::new(input_dir).max_depth(1).into_iter().filter(|entry| {
+                if let Ok(entry) = entry {
+                    entry.path().is_file() && !should_skip_file(entry.path())
+                } else {
+                    false
+                }
+            }).count()
+        };
+        
+        result.total_files = total_files;
+        
+        if files_to_process.is_empty() {
+            println!("Git detected {} files in source directory, but none have changed since last commit", total_files);
+            println!("No files to process (no changes detected by git)");
+            
+            // Log all files as "Not Modified" and "Skipped"
+            if verbose {
+                let walker = if recursive {
+                    WalkDir::new(input_dir).into_iter()
+                } else {
+                    WalkDir::new(input_dir).max_depth(1).into_iter()
+                };
+                
+                for entry in walker {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_file() && !should_skip_file(path) {
+                            let filename = path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown");
+                            log_file_processing("INFO", FileStatus::NotModified, filename, TimestampProcess::Skipped, verbose);
+                        }
+                    }
+                }
+            }
+            
+            // Mark all files as skipped since none needed processing
+            for _ in 0..total_files {
+                result.add_skipped();
+            }
+        } else {
+            println!("Git detected {} files to process:", files_to_process.len());
+            
+            
+            // Mark non-processed files as skipped
+            let skipped_count = total_files - files_to_process.len();
+            for _ in 0..skipped_count {
+                result.add_skipped();
+            }
+        }
+        
+        let files_to_process_count = files_to_process.len();
+        
+        for path in &files_to_process {
+            let filename = path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown");
+            
+            // Determine if this is a new file or modified file
+            let file_status = if untracked_files.contains(path) {
+                FileStatus::New
+            } else {
+                FileStatus::Modified
+            };
+            
+            if dry_run {
+                println!("Would process: {}", path.display());
+                log_file_processing("INFO", file_status, filename, TimestampProcess::Processed, verbose);
+                result.add_processed();
+            } else {
+                match process_single_file_batch(path, output_dir, tsa_url, tsa_cert_path, no_verify) {
+                    Ok(_) => {
+                        println!("Processed: {}", path.display());
+                        log_file_processing("INFO", file_status, filename, TimestampProcess::Processed, verbose);
+                        result.add_processed();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to process {}: {}", path.display(), e);
+                        log_file_processing("ERROR", file_status, filename, TimestampProcess::Error, verbose);
+                        result.add_failed(format!("{}: {}", path.display(), e));
+                    }
+                }
+            }
+        }
+        
+        // Log skipped files
+        if verbose {
+            let skipped_count = total_files - files_to_process_count;
+            if skipped_count > 0 {
+                let walker = if recursive {
+                    WalkDir::new(input_dir).into_iter()
+                } else {
+                    WalkDir::new(input_dir).max_depth(1).into_iter()
+                };
+                
+                for entry in walker {
+                    if let Ok(entry) = entry {
+                        let path = entry.path();
+                        if path.is_file() && !should_skip_file(path) && !files_to_process.contains(&path.to_path_buf()) {
+                            let filename = path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown");
+                            log_file_processing("INFO", FileStatus::NotModified, filename, TimestampProcess::Skipped, verbose);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Commit changes after processing
+        if !dry_run {
+            git_add_and_commit(&input_dir_abs, parent_dir)?;
+        }
+    } else {
+        // Traditional workflow
+        let walker = if recursive {
+            WalkDir::new(input_dir).into_iter()
+        } else {
+            WalkDir::new(input_dir).max_depth(1).into_iter()
+        };
+        
+        for entry in walker {
+            let entry = entry?;
+            let path = entry.path();
+            
+            if path.is_dir() {
+                continue;
+            }
+            
+            if should_skip_file(path) {
+                continue;
+            }
+            
+            result.total_files += 1;
+            
+            if has_timestamp(path, output_dir) {
+                if re_timestamp {
+                    // Check if file has changed since timestamping using existing verification logic
+                    match file_has_changed_since_timestamp(path, output_dir) {
+                        Ok(has_changed) => {
+                            if has_changed {
+                                println!("Re-timestamping {} (file has changed since last timestamp)", path.display());
+                                let filename = path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("unknown");
+                                log_file_processing("INFO", FileStatus::Modified, filename, TimestampProcess::Processed, verbose);
+                                // Continue to process the file
+                            } else {
+                                println!("Skipping {} (already timestamped and unchanged)", path.display());
+                                let filename = path.file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("unknown");
+                                log_file_processing("INFO", FileStatus::NotModified, filename, TimestampProcess::Skipped, verbose);
+                                result.add_skipped();
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Could not verify timestamp for {}: {}", path.display(), e);
+                            println!("Re-timestamping {} (verification failed)", path.display());
+                            let filename = path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown");
+                            log_file_processing("WARNING", FileStatus::Modified, filename, TimestampProcess::Processed, verbose);
+                            // Continue to process the file
+                        }
+                    }
+                } else {
+                    println!("Skipping {} (already timestamped)", path.display());
+                    let filename = path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("unknown");
+                    log_file_processing("INFO", FileStatus::NotModified, filename, TimestampProcess::Skipped, verbose);
+                    result.add_skipped();
+                    continue;
+                }
+            } else {
+                // New file (no existing timestamp)
+                let filename = path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown");
+                log_file_processing("INFO", FileStatus::New, filename, TimestampProcess::Processed, verbose);
+            }
+            
+            if dry_run {
+                println!("Would process: {}", path.display());
+                result.add_processed();
+            } else {
+                match process_single_file_batch(path, output_dir, tsa_url, tsa_cert_path, no_verify) {
+                    Ok(_) => {
+                        println!("Processed: {}", path.display());
+                        result.add_processed();
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to process {}: {}", path.display(), e);
+                        result.add_failed(format!("{}: {}", path.display(), e));
+                        
+                        // Log error if verbose logging is enabled
+                        let filename = path.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown");
+                        log_file_processing("ERROR", FileStatus::New, filename, TimestampProcess::Error, verbose);
+                    }
                 }
             }
         }
@@ -750,6 +962,344 @@ fn has_timestamp(input_file: &std::path::Path, output_dir: &PathBuf) -> bool {
         }
     }
     false
+}
+
+fn file_has_changed_since_timestamp(input_file: &std::path::Path, output_dir: &PathBuf) -> AnyhowResult<bool> {
+    if let Some(filename) = input_file.file_stem() {
+        if let Some(name) = filename.to_str() {
+            let tsr_path = output_dir.join(format!("{}.tsr", name));
+            if !tsr_path.exists() {
+                return Ok(false);
+            }
+            
+            // Use existing verification logic to check if file hash matches timestamp
+            match verify_timestamp(&input_file.to_path_buf(), &tsr_path) {
+                Ok(verification_result) => {
+                    // If verification fails (success = false), file has changed
+                    return Ok(!verification_result.success);
+                }
+                Err(_) => {
+                    // If verification fails due to error, assume file needs re-timestamping
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Git-based change detection functions
+fn create_git_command() -> std::process::Command {
+    std::process::Command::new("/usr/bin/git")
+}
+
+/// Get git-deleted files (files that existed before but are now deleted)
+fn get_git_deleted_files(source_dir: &std::path::Path, parent_dir: &std::path::Path) -> AnyhowResult<Vec<std::path::PathBuf>> {
+    let mut cmd = create_git_command();
+    cmd.current_dir(parent_dir)
+        .args(&["diff", "--name-only", "--diff-filter=D", "HEAD"]);
+    
+    let output = cmd.output()
+        .with_context(|| "Failed to execute git diff for deleted files")?;
+    
+    if !output.status.success() {
+        // If no commits exist yet, return empty list
+        if output.status.code() == Some(128) {
+            return Ok(Vec::new());
+        }
+        return Err(anyhow::anyhow!("Git diff failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    
+    let deleted_files: Vec<std::path::PathBuf> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let path = std::path::Path::new(line);
+            // Only include files within the source directory
+            if path.starts_with(source_dir.strip_prefix(parent_dir).unwrap_or(source_dir)) {
+                Some(source_dir.join(path.strip_prefix(source_dir.strip_prefix(parent_dir).unwrap_or(source_dir)).unwrap_or(path)))
+            } else {
+                None
+            }
+        })
+        .filter(|path| !should_skip_file(path))
+        .collect();
+    
+    Ok(deleted_files)
+}
+
+/// Clean up timestamp files for deleted source files
+fn cleanup_deleted_file_timestamps(
+    deleted_files: &[std::path::PathBuf],
+    output_dir: &PathBuf,
+    verbose: bool,
+) -> AnyhowResult<()> {
+    let mut cleaned_count = 0;
+    
+    for deleted_file in deleted_files {
+        // Get the file stem (name without extension) to find the corresponding timestamp file
+        if let Some(file_stem) = deleted_file.file_stem() {
+            if let Some(stem_str) = file_stem.to_str() {
+                let timestamp_file = output_dir.join(format!("{}.tsr", stem_str));
+                let timestamp_query = output_dir.join(format!("{}.tsq", stem_str));
+                let timestamp_certs = output_dir.join(format!("{}.tsr.certs.pem", stem_str));
+                
+                if timestamp_file.exists() {
+                    if verbose {
+                        let filename = deleted_file.file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown");
+                        log_file_processing("INFO", FileStatus::NotModified, filename, TimestampProcess::Skipped, true);
+                        println!("Cleaning up timestamp for deleted file: {} -> {}", deleted_file.display(), timestamp_file.display());
+                    }
+                    
+                    // Remove all associated timestamp files
+                    let files_to_remove = vec![timestamp_file.clone(), timestamp_query, timestamp_certs];
+                    for file in files_to_remove {
+                        if file.exists() {
+                            if let Err(e) = std::fs::remove_file(&file) {
+                                eprintln!("Warning: Failed to remove timestamp file {}: {}", file.display(), e);
+                            } else if verbose {
+                                println!("Removed timestamp file: {}", file.display());
+                            }
+                        }
+                    }
+                    
+                    cleaned_count += 1;
+                    if verbose {
+                        println!("Removed timestamp for deleted file: {}", timestamp_file.display());
+                    }
+                }
+            }
+        }
+    }
+    
+    if cleaned_count > 0 {
+        println!("Cleaned up {} timestamp files for deleted source files", cleaned_count);
+    } else if verbose {
+        println!("No timestamp files to clean up for deleted files");
+    }
+    
+    Ok(())
+}
+
+
+/// Logging functions for detailed file processing information
+#[derive(Debug, Clone, Copy)]
+pub enum FileStatus {
+    New,
+    Modified,
+    NotModified,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TimestampProcess {
+    Processed,
+    Skipped,
+    Error,
+}
+
+fn log_file_processing(
+    level: &str,
+    file_status: FileStatus,
+    filename: &str,
+    timestamp_process: TimestampProcess,
+    verbose: bool,
+) {
+    if verbose {
+        let now = chrono::Utc::now();
+        let timestamp = now.format("%Y-%m-%d@%H:%M:%S:%3f").to_string();
+        
+        // Color the log level
+        let colored_level = match level {
+            "ERROR" => level.red().bold(),
+            "WARNING" => level.yellow().bold(),
+            _ => level.normal(), // INFO uses default terminal color
+        };
+        
+        // Color the file status and everything after the date
+        let (_file_status_str, colored_content) = match file_status {
+            FileStatus::New => {
+                let status = "New".green().bold();
+                let colored_filename = filename.green().bold();
+                let colored_line = format!("{} {} {}", status, colored_filename, match timestamp_process {
+                    TimestampProcess::Processed => "Processed".green(),
+                    TimestampProcess::Skipped => "Skipped".bright_black(),
+                    TimestampProcess::Error => "Error".red(),
+                });
+                ("New", colored_line)
+            },
+            FileStatus::Modified => {
+                let status = "Modified".bright_yellow().bold();
+                let colored_filename = filename.bright_yellow().bold();
+                let colored_line = format!("{} {} {}", status, colored_filename, match timestamp_process {
+                    TimestampProcess::Processed => "Processed".bright_yellow(),
+                    TimestampProcess::Skipped => "Skipped".bright_black(),
+                    TimestampProcess::Error => "Error".red(),
+                });
+                ("Modified", colored_line)
+            },
+            FileStatus::NotModified => {
+                let status = "Not Modified".bright_black();
+                let colored_filename = filename.bright_black();
+                let colored_line = format!("{} {} {}", status, colored_filename, match timestamp_process {
+                    TimestampProcess::Processed => "Processed".green(),
+                    TimestampProcess::Skipped => "Skipped".bright_black(),
+                    TimestampProcess::Error => "Error".red(),
+                });
+                ("Not Modified", colored_line)
+            },
+        };
+        
+        let log_message = format!(
+            "[{}] {} {}",
+            colored_level,
+            timestamp,
+            colored_content
+        );
+        
+        match level {
+            "ERROR" => eprintln!("{}", log_message),
+            "WARNING" => eprintln!("{}", log_message),
+            _ => println!("{}", log_message),
+        }
+    }
+}
+
+fn ensure_git_repository(parent_dir: &std::path::Path) -> AnyhowResult<()> {
+    let git_dir = parent_dir.join(".git");
+    
+    if !git_dir.exists() {
+        println!("Initializing git repository in parent directory: {}", parent_dir.display());
+        let output = create_git_command()
+            .args(&["init"])
+            .current_dir(parent_dir)
+            .output()
+            .with_context(|| "Failed to initialize git repository. Make sure git is installed.")?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to initialize git repository: {}", stderr));
+        }
+        
+        // Create a .gitignore to avoid tracking timestamp files and other artifacts
+        let gitignore_content = "# StampTime - Ignore timestamp files and artifacts\n*.tsr\n*.tsq\n*.p12\n*.pem\n*.crt\n.DS_Store\n*.tmp\n*.log\n";
+        std::fs::write(parent_dir.join(".gitignore"), gitignore_content)
+            .with_context(|| "Failed to create .gitignore file")?;
+    }
+    
+    Ok(())
+}
+
+fn get_git_changed_files(source_dir: &std::path::Path, parent_dir: &std::path::Path) -> AnyhowResult<Vec<std::path::PathBuf>> {
+    // Check if there are any commits (if not, no files are changed relative to HEAD)
+    let log_output = create_git_command()
+        .args(&["log", "--oneline", "-1"])
+        .current_dir(parent_dir)
+        .output()
+        .with_context(|| "Failed to check git log")?;
+    
+    // If no commits exist (exit code 128 is typical for "no commits"), return empty list
+    if !log_output.status.success() {
+        let stderr = String::from_utf8_lossy(&log_output.stderr);
+        if stderr.contains("does not have any commits") || log_output.status.code() == Some(128) {
+            return Ok(Vec::new());
+        } else {
+            return Err(anyhow::anyhow!("Git log failed: {}", stderr));
+        }
+    }
+    
+    let output = create_git_command()
+        .args(&["diff", "--name-only", "--diff-filter=AM", "HEAD"])
+        .current_dir(parent_dir)
+        .output()
+        .with_context(|| "Failed to run git diff command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Git diff failed: {}", stderr));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut changed_files = Vec::new();
+    
+    for line in stdout.lines() {
+        let file_path = parent_dir.join(line);
+        if file_path.starts_with(source_dir) && file_path.is_file() && !should_skip_file(&file_path) {
+            changed_files.push(file_path);
+        }
+    }
+    
+    Ok(changed_files)
+}
+
+fn get_git_untracked_files(source_dir: &std::path::Path, parent_dir: &std::path::Path) -> AnyhowResult<Vec<std::path::PathBuf>> {
+    let output = create_git_command()
+        .args(&["ls-files", "--others", "--exclude-standard"])
+        .current_dir(parent_dir)
+        .output()
+        .with_context(|| "Failed to run git ls-files command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Git ls-files failed: {}", stderr));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut untracked_files = Vec::new();
+    
+    for line in stdout.lines() {
+        let file_path = parent_dir.join(line);
+        if file_path.starts_with(source_dir) && file_path.is_file() && !should_skip_file(&file_path) {
+            untracked_files.push(file_path);
+        }
+    }
+    
+    Ok(untracked_files)
+}
+
+fn git_add_and_commit(source_dir: &std::path::Path, parent_dir: &std::path::Path) -> AnyhowResult<()> {
+    // Add all files in the source directory
+    let output = create_git_command()
+        .args(&["add", source_dir.to_str().unwrap()])
+        .current_dir(parent_dir)
+        .output()
+        .with_context(|| "Failed to run git add command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Git add failed: {}", stderr));
+    }
+    
+    // Check if there are any changes to commit
+    let status_output = create_git_command()
+        .args(&["diff", "--cached", "--quiet"])
+        .current_dir(parent_dir)
+        .output()
+        .with_context(|| "Failed to check git status")?;
+    
+    // If exit code is 0, there are no changes to commit
+    if status_output.status.success() {
+        println!("No changes to commit");
+        return Ok(());
+    }
+    
+    // Commit the changes
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let commit_message = format!("StampTime batch processing - {}", timestamp);
+    
+    let output = create_git_command()
+        .args(&["commit", "-m", &commit_message])
+        .current_dir(parent_dir)
+        .output()
+        .with_context(|| "Failed to run git commit command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Git commit failed: {}", stderr));
+    }
+    
+    println!("Git commit successful: {}", commit_message);
+    Ok(())
 }
 
 fn process_single_file_batch(

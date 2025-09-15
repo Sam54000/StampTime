@@ -9,6 +9,6 @@ intermediate = "https://knowledge.digicert.com/content/dam/kb/attachments/time-s
 root = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertTrustedRootG4.cer"
 
 [path]
-base = "/Users/samuel/Desktop/certifications"
-chain_dir = "LeChain"
-chain_filename = "chain.pem"
+base = "./tsa_cert"
+chain_dir = "chain"
+chain_filename = "digicert_tsa_chain.pem"

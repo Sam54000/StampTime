@@ -66,9 +66,13 @@ fn main() -> AnyhowResult<()> {
             tsa_cert, 
             no_verify, 
             recursive, 
-            dry_run 
+            dry_run,
+            re_timestamp,
+            use_git,
+            verbose,
+            cleanup
         } => {
-            handle_cert_command(input, output, batch, tsa_url, tsa_cert, no_verify, recursive, dry_run)?;
+            handle_cert_command(input, output, batch, tsa_url, tsa_cert, no_verify, recursive, dry_run, re_timestamp, use_git, verbose, cleanup)?;
         }
         Commands::Verify { file, timestamp_file } => {
             handle_verify_command(file, timestamp_file)?;

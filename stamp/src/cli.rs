@@ -96,6 +96,22 @@ pub enum Commands {
         /// Dry run - show what would be processed without actually doing it
         #[arg(long, help = "Show what would be processed without actually doing it")]
         dry_run: bool,
+        
+        /// Re-timestamp files that have changed since their last timestamp
+        #[arg(long, help = "Re-timestamp files that have been modified since their last timestamp (checks file hash)")]
+        re_timestamp: bool,
+        
+        /// Use git to detect file changes (faster than hash comparison)
+        #[arg(long, help = "Use git to detect file changes for re-timestamping (requires git repository)")]
+        use_git: bool,
+        
+        /// Verbose logging - show detailed file processing logs in real-time
+        #[arg(short, long, help = "Show detailed file processing logs with timestamps and status")]
+        verbose: bool,
+        
+        /// Clean up orphaned timestamp files (remove timestamps for files no longer in source)
+        #[arg(long, help = "Remove timestamp files for files that no longer exist in source directory (requires --use-git)")]
+        cleanup: bool,
     },
     /// Verify timestamp files
     Verify {
@@ -185,9 +201,13 @@ pub fn handle_cert_command(
     no_verify: bool,
     recursive: bool,
     dry_run: bool,
+    re_timestamp: bool,
+    use_git: bool,
+    verbose: bool,
+    cleanup: bool,
 ) -> AnyhowResult<()> {
     if batch {
-        handle_batch_timestamping(input, output, tsa_url, tsa_cert, no_verify, recursive, dry_run)?;
+        handle_batch_timestamping(input, output, tsa_url, tsa_cert, no_verify, recursive, dry_run, re_timestamp, use_git, verbose, cleanup)?;
     } else {
         handle_single_file_timestamping(input, output, tsa_url, tsa_cert, no_verify)?;
     }
@@ -335,6 +355,10 @@ fn handle_batch_timestamping(
     no_verify: bool,
     recursive: bool,
     dry_run: bool,
+    re_timestamp: bool,
+    use_git: bool,
+    verbose: bool,
+    cleanup: bool,
 ) -> AnyhowResult<()> {
     info!("Input directory: {}", input.display());
     
@@ -384,7 +408,7 @@ fn handle_batch_timestamping(
     }
     
     let mut result = BatchResult::new();
-    process_directory_batch(&input, &output_dir, &tsa_url, &tsa_cert_path, no_verify, recursive, dry_run, &mut result)?;
+    process_directory_batch(&input, &output_dir, &tsa_url, &tsa_cert_path, no_verify, recursive, dry_run, re_timestamp, use_git, verbose, cleanup, &mut result)?;
     
     result.print_summary();
     
