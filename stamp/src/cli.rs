@@ -121,6 +121,11 @@ pub enum Commands {
         /// Timestamp file (.tsr)
         timestamp_file: PathBuf,
     },
+    /// Inspect timestamp responses, queries, and certificates
+    Inspect {
+        /// File to inspect (timestamp response, query, or certificate)
+        file: PathBuf,
+    },
 }
 
 /// Keygen subcommands
@@ -262,6 +267,30 @@ pub fn handle_verify_command(file: PathBuf, timestamp_file: PathBuf) -> AnyhowRe
         }
         Err(e) => {
             eprintln!("Error during verification: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub fn handle_inspect_command(file: PathBuf) -> AnyhowResult<()> {
+    info!("Inspecting file: {}", file.display());
+    
+    if !file.exists() {
+        error!("File does not exist: {}", file.display());
+        std::process::exit(1);
+    }
+    
+    if !file.is_file() {
+        error!("Path is not a file: {}", file.display());
+        std::process::exit(1);
+    }
+    
+    match timestamp::inspect_file(&file) {
+        Ok(_) => {
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("Error during inspection: {}", e);
             std::process::exit(1);
         }
     }

@@ -1318,3 +1318,532 @@ fn process_single_file_batch(
     
     Ok(())
 }
+
+/// File types that can be inspected
+#[derive(Debug, Clone)]
+pub enum InspectableFileType {
+    TimestampResponse,
+    TimestampQuery,
+    Certificate,
+    Unknown,
+}
+
+/// Main inspection function that determines file type and displays appropriate information
+pub fn inspect_file(file_path: &PathBuf) -> AnyhowResult<()> {
+    let file_type = detect_file_type(file_path)?;
+    
+    println!("File: {}", file_path.display());
+    println!("Type: {}", format_file_type(&file_type));
+    println!("Size: {} bytes", std::fs::metadata(file_path)?.len());
+    println!();
+    
+    match file_type {
+        InspectableFileType::TimestampResponse => {
+            inspect_timestamp_response(file_path)?;
+        }
+        InspectableFileType::TimestampQuery => {
+            inspect_timestamp_query(file_path)?;
+        }
+        InspectableFileType::Certificate => {
+            inspect_certificate(file_path)?;
+        }
+        InspectableFileType::Unknown => {
+            println!("Unknown file type. Cannot determine if this is a timestamp response, query, or certificate.");
+            println!("Supported file types:");
+            println!("  • Timestamp Response (.tsr)");
+            println!("  • Timestamp Query (.tsq)");
+            println!("  • Certificate (.pem, .crt, .cer, .p12)");
+        }
+    }
+    
+    Ok(())
+}
+
+/// Detect the type of file based on extension and content
+fn detect_file_type(file_path: &PathBuf) -> AnyhowResult<InspectableFileType> {
+    // First check by file extension
+    if let Some(extension) = file_path.extension() {
+        if let Some(ext) = extension.to_str() {
+            match ext.to_lowercase().as_str() {
+                "tsr" => return Ok(InspectableFileType::TimestampResponse),
+                "tsq" => return Ok(InspectableFileType::TimestampQuery),
+                "pem" | "crt" | "cer" => return Ok(InspectableFileType::Certificate),
+                "p12" | "pfx" => return Ok(InspectableFileType::Certificate),
+                _ => {}
+            }
+        }
+    }
+    
+    // If extension doesn't help, try to detect by content
+    let file_data = std::fs::read(file_path)?;
+    
+    // Check if it's a timestamp response by trying to parse it
+    if is_timestamp_response(&file_data) {
+        return Ok(InspectableFileType::TimestampResponse);
+    }
+    
+    // Check if it's a timestamp query
+    if is_timestamp_query(&file_data) {
+        return Ok(InspectableFileType::TimestampQuery);
+    }
+    
+    // Check if it's a certificate
+    if is_certificate(&file_data) {
+        return Ok(InspectableFileType::Certificate);
+    }
+    
+    Ok(InspectableFileType::Unknown)
+}
+
+/// Check if data appears to be a timestamp response
+fn is_timestamp_response(data: &[u8]) -> bool {
+    // Try to use OpenSSL to parse as timestamp response
+    use std::process::Command;
+    use tempfile::NamedTempFile;
+    
+    if let Ok(mut temp_file) = NamedTempFile::new() {
+        if temp_file.write_all(data).is_ok() && temp_file.flush().is_ok() {
+            let output = Command::new("openssl")
+                .args(&["ts", "-reply", "-in", temp_file.path().to_str().unwrap(), "-text"])
+                .output();
+            
+            if let Ok(output) = output {
+                return output.status.success();
+            }
+        }
+    }
+    false
+}
+
+/// Check if data appears to be a timestamp query
+fn is_timestamp_query(data: &[u8]) -> bool {
+    // Try to use OpenSSL to parse as timestamp query
+    use std::process::Command;
+    use tempfile::NamedTempFile;
+    
+    if let Ok(mut temp_file) = NamedTempFile::new() {
+        if temp_file.write_all(data).is_ok() && temp_file.flush().is_ok() {
+            let output = Command::new("openssl")
+                .args(&["ts", "-query", "-in", temp_file.path().to_str().unwrap(), "-text"])
+                .output();
+            
+            if let Ok(output) = output {
+                return output.status.success();
+            }
+        }
+    }
+    false
+}
+
+/// Check if data appears to be a certificate
+fn is_certificate(data: &[u8]) -> bool {
+    // Check for PEM format
+    if let Ok(text) = std::str::from_utf8(data) {
+        if text.contains("-----BEGIN CERTIFICATE-----") {
+            return true;
+        }
+        if text.contains("-----BEGIN PKCS12-----") {
+            return true;
+        }
+    }
+    
+    // Try to parse as DER certificate
+    use std::process::Command;
+    use tempfile::NamedTempFile;
+    
+    if let Ok(mut temp_file) = NamedTempFile::new() {
+        if temp_file.write_all(data).is_ok() && temp_file.flush().is_ok() {
+            let output = Command::new("openssl")
+                .args(&["x509", "-inform", "DER", "-in", temp_file.path().to_str().unwrap(), "-text", "-noout"])
+                .output();
+            
+            if let Ok(output) = output {
+                return output.status.success();
+            }
+            
+            // Try PEM format
+            let output = Command::new("openssl")
+                .args(&["x509", "-in", temp_file.path().to_str().unwrap(), "-text", "-noout"])
+                .output();
+            
+            if let Ok(output) = output {
+                return output.status.success();
+            }
+        }
+    }
+    
+    false
+}
+
+/// Format file type for display
+fn format_file_type(file_type: &InspectableFileType) -> &'static str {
+    match file_type {
+        InspectableFileType::TimestampResponse => "Timestamp Response (.tsr)",
+        InspectableFileType::TimestampQuery => "Timestamp Query (.tsq)",
+        InspectableFileType::Certificate => "Certificate",
+        InspectableFileType::Unknown => "Unknown",
+    }
+}
+
+/// Inspect a timestamp response file
+fn inspect_timestamp_response(file_path: &PathBuf) -> AnyhowResult<()> {
+    let file_data = std::fs::read(file_path)?;
+    
+    // Get detailed information using OpenSSL
+    let tsr_info = get_timestamp_response_info(&file_data)?;
+    
+    println!("=== TIMESTAMP RESPONSE INFORMATION ===");
+    println!();
+    
+    // Basic information
+    if let Some(status) = tsr_info.get("Status") {
+        println!("Status: {}", status);
+    }
+    
+    if let Some(timestamp) = tsr_info.get("Time stamp") {
+        println!("Timestamp: {}", timestamp);
+    }
+    
+    if let Some(hash_algo) = tsr_info.get("Hash Algorithm") {
+        println!("Hash Algorithm: {}", hash_algo);
+    }
+    
+    if let Some(message_imprint) = tsr_info.get("Message data") {
+        println!("Message Imprint (Hash): {}", message_imprint);
+    }
+    
+    if let Some(tsa) = tsr_info.get("TSA") {
+        println!("TSA: {}", tsa);
+    }
+    
+    if let Some(accuracy) = tsr_info.get("Accuracy") {
+        println!("Accuracy: {}", accuracy);
+    }
+    
+    if let Some(ordering) = tsr_info.get("Ordering") {
+        println!("Ordering: {}", ordering);
+    }
+    
+    if let Some(nonce) = tsr_info.get("Nonce") {
+        println!("Nonce: {}", nonce);
+    }
+    
+    if let Some(tsa_cert_id) = tsr_info.get("TSA Cert ID") {
+        println!("TSA Certificate ID: {}", tsa_cert_id);
+    }
+    
+    // Certificate information
+    if let Some(cert_count) = tsr_info.get("Certificate count") {
+        println!("Certificate count: {}", cert_count);
+    }
+    
+    // Show certificates if present
+    let certificates = extract_timestamp_certificates(&file_data)?;
+    if !certificates.is_empty() && certificates[0] != "No certificates found in timestamp response" {
+        println!();
+        println!("=== CERTIFICATES ===");
+        for (i, cert) in certificates.iter().enumerate() {
+            println!("Certificate {}:", i + 1);
+            println!("{}", cert);
+            if i < certificates.len() - 1 {
+                println!();
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Inspect a timestamp query file
+fn inspect_timestamp_query(file_path: &PathBuf) -> AnyhowResult<()> {
+    let file_data = std::fs::read(file_path)?;
+    
+    // Get detailed information using OpenSSL
+    let tsq_info = get_timestamp_query_info(&file_data)?;
+    
+    println!("=== TIMESTAMP QUERY INFORMATION ===");
+    println!();
+    
+    // Basic information
+    if let Some(version) = tsq_info.get("Version") {
+        println!("Version: {}", version);
+    }
+    
+    if let Some(policy) = tsq_info.get("Policy") {
+        println!("Policy: {}", policy);
+    }
+    
+    if let Some(hash_algo) = tsq_info.get("Hash Algorithm") {
+        println!("Hash Algorithm: {}", hash_algo);
+    }
+    
+    if let Some(message_imprint) = tsq_info.get("Message data") {
+        println!("Message Imprint (Hash): {}", message_imprint);
+    }
+    
+    if let Some(nonce) = tsq_info.get("Nonce") {
+        println!("Nonce: {}", nonce);
+    }
+    
+    if let Some(cert_req) = tsq_info.get("Cert req") {
+        println!("Certificate Request: {}", cert_req);
+    }
+    
+    if let Some(extensions) = tsq_info.get("Extensions") {
+        println!("Extensions: {}", extensions);
+    }
+    
+    Ok(())
+}
+
+/// Inspect a certificate file
+fn inspect_certificate(file_path: &PathBuf) -> AnyhowResult<()> {
+    let file_data = std::fs::read(file_path)?;
+    
+    // Determine certificate format and get information
+    let cert_info = get_certificate_info(&file_data, file_path)?;
+    
+    println!("=== CERTIFICATE INFORMATION ===");
+    println!();
+    
+    // Basic information
+    if let Some(version) = cert_info.get("Version") {
+        println!("Version: {}", version);
+    }
+    
+    if let Some(serial) = cert_info.get("Serial Number") {
+        println!("Serial Number: {}", serial);
+    }
+    
+    if let Some(signature_algo) = cert_info.get("Signature Algorithm") {
+        println!("Signature Algorithm: {}", signature_algo);
+    }
+    
+    if let Some(issuer) = cert_info.get("Issuer") {
+        println!("Issuer: {}", issuer);
+    }
+    
+    if let Some(validity) = cert_info.get("Validity") {
+        println!("Validity: {}", validity);
+    }
+    
+    if let Some(not_before) = cert_info.get("Not Before") {
+        println!("Not Before: {}", not_before);
+    }
+    
+    if let Some(not_after) = cert_info.get("Not After") {
+        println!("Not After: {}", not_after);
+    }
+    
+    if let Some(subject) = cert_info.get("Subject") {
+        println!("Subject: {}", subject);
+    }
+    
+    if let Some(public_key) = cert_info.get("Public Key") {
+        println!("Public Key: {}", public_key);
+    }
+    
+    if let Some(key_usage) = cert_info.get("X509v3 Key Usage") {
+        println!("Key Usage: {}", key_usage);
+    }
+    
+    if let Some(ext_key_usage) = cert_info.get("X509v3 Extended Key Usage") {
+        println!("Extended Key Usage: {}", ext_key_usage);
+    }
+    
+    if let Some(basic_constraints) = cert_info.get("X509v3 Basic Constraints") {
+        println!("Basic Constraints: {}", basic_constraints);
+    }
+    
+    if let Some(subject_alt_name) = cert_info.get("X509v3 Subject Alternative Name") {
+        println!("Subject Alternative Name: {}", subject_alt_name);
+    }
+    
+    Ok(())
+}
+
+/// Get detailed information from a timestamp response
+fn get_timestamp_response_info(tsr_data: &[u8]) -> AnyhowResult<std::collections::HashMap<String, String>> {
+    use std::process::Command;
+    use tempfile::NamedTempFile;
+    
+    let mut temp_tsr = NamedTempFile::new()
+        .with_context(|| "Failed to create temporary TSR file")?;
+    temp_tsr.write_all(tsr_data)
+        .with_context(|| "Failed to write TSR data to temporary file")?;
+    temp_tsr.flush()
+        .with_context(|| "Failed to flush temporary TSR file")?;
+    
+    let output = Command::new("openssl")
+        .args(&[
+            "ts", "-reply", 
+            "-in", temp_tsr.path().to_str().unwrap(),
+            "-text"
+        ])
+        .output()
+        .with_context(|| "Failed to execute openssl ts command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("OpenSSL ts command failed: {}", stderr));
+    }
+    
+    let tsr_text = String::from_utf8_lossy(&output.stdout);
+    let _ = std::fs::remove_file(temp_tsr.path());
+    
+    parse_timestamp_info(&tsr_text)
+}
+
+/// Get detailed information from a timestamp query
+fn get_timestamp_query_info(tsq_data: &[u8]) -> AnyhowResult<std::collections::HashMap<String, String>> {
+    use std::process::Command;
+    use tempfile::NamedTempFile;
+    
+    let mut temp_tsq = NamedTempFile::new()
+        .with_context(|| "Failed to create temporary TSQ file")?;
+    temp_tsq.write_all(tsq_data)
+        .with_context(|| "Failed to write TSQ data to temporary file")?;
+    temp_tsq.flush()
+        .with_context(|| "Failed to flush temporary TSQ file")?;
+    
+    let output = Command::new("openssl")
+        .args(&[
+            "ts", "-query", 
+            "-in", temp_tsq.path().to_str().unwrap(),
+            "-text"
+        ])
+        .output()
+        .with_context(|| "Failed to execute openssl ts command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("OpenSSL ts command failed: {}", stderr));
+    }
+    
+    let tsq_text = String::from_utf8_lossy(&output.stdout);
+    let _ = std::fs::remove_file(temp_tsq.path());
+    
+    parse_timestamp_info(&tsq_text)
+}
+
+/// Get detailed information from a certificate
+fn get_certificate_info(cert_data: &[u8], file_path: &PathBuf) -> AnyhowResult<std::collections::HashMap<String, String>> {
+    use std::process::Command;
+    use tempfile::NamedTempFile;
+    
+    let mut temp_cert = NamedTempFile::new()
+        .with_context(|| "Failed to create temporary certificate file")?;
+    temp_cert.write_all(cert_data)
+        .with_context(|| "Failed to write certificate data to temporary file")?;
+    temp_cert.flush()
+        .with_context(|| "Failed to flush temporary certificate file")?;
+    
+    // Try different formats
+    let mut output = Command::new("openssl")
+        .args(&[
+            "x509", "-in", temp_cert.path().to_str().unwrap(),
+            "-text", "-noout"
+        ])
+        .output();
+    
+    // If PEM format fails, try DER format
+    if output.as_ref().map(|o| !o.status.success()).unwrap_or(true) {
+        output = Command::new("openssl")
+            .args(&[
+                "x509", "-inform", "DER", "-in", temp_cert.path().to_str().unwrap(),
+                "-text", "-noout"
+            ])
+            .output();
+    }
+    
+    // If both fail, try PKCS#12 format
+    if output.as_ref().map(|o| !o.status.success()).unwrap_or(true) {
+        if let Some(extension) = file_path.extension() {
+            if let Some(ext) = extension.to_str() {
+                if ext.to_lowercase() == "p12" || ext.to_lowercase() == "pfx" {
+                    output = Command::new("openssl")
+                        .args(&[
+                            "pkcs12", "-in", temp_cert.path().to_str().unwrap(),
+                            "-nokeys", "-clcerts", "-passin", "pass:"
+                        ])
+                        .output();
+                }
+            }
+        }
+    }
+    
+    let output = output.with_context(|| "Failed to execute openssl x509 command")?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("OpenSSL x509 command failed: {}", stderr));
+    }
+    
+    let cert_text = String::from_utf8_lossy(&output.stdout);
+    let _ = std::fs::remove_file(temp_cert.path());
+    
+    parse_certificate_info(&cert_text)
+}
+
+/// Parse timestamp information from OpenSSL output
+fn parse_timestamp_info(text: &str) -> AnyhowResult<std::collections::HashMap<String, String>> {
+    let mut info = std::collections::HashMap::new();
+    
+    for line in text.lines() {
+        let line = line.trim();
+        
+        // Parse key-value pairs
+        if let Some(colon_pos) = line.find(':') {
+            let key = line[..colon_pos].trim();
+            let value = line[colon_pos + 1..].trim();
+            
+            if !value.is_empty() {
+                info.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    
+    Ok(info)
+}
+
+/// Parse certificate information from OpenSSL output
+fn parse_certificate_info(text: &str) -> AnyhowResult<std::collections::HashMap<String, String>> {
+    let mut info = std::collections::HashMap::new();
+    
+    for line in text.lines() {
+        let line = line.trim();
+        
+        if line.is_empty() {
+            continue;
+        }
+        
+        // Parse key-value pairs with more flexible matching
+        if let Some(colon_pos) = line.find(':') {
+            let key = line[..colon_pos].trim();
+            let value = line[colon_pos + 1..].trim();
+            
+            if !value.is_empty() {
+                // Map OpenSSL output keys to our display keys
+                let display_key = match key {
+                    "Version" => "Version",
+                    "Serial Number" => "Serial Number", 
+                    "Signature Algorithm" => "Signature Algorithm",
+                    "Issuer" => "Issuer",
+                    "Validity" => "Validity",
+                    "Not Before" => "Not Before",
+                    "Not After" => "Not After", 
+                    "Subject" => "Subject",
+                    "Public Key" => "Public Key",
+                    "X509v3 Key Usage" => "X509v3 Key Usage",
+                    "X509v3 Extended Key Usage" => "X509v3 Extended Key Usage",
+                    "X509v3 Basic Constraints" => "X509v3 Basic Constraints",
+                    "X509v3 Subject Alternative Name" => "X509v3 Subject Alternative Name",
+                    _ => continue, // Skip unknown keys
+                };
+                info.insert(display_key.to_string(), value.to_string());
+            }
+        }
+    }
+    
+    Ok(info)
+}

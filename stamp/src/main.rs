@@ -29,7 +29,7 @@ mod cli;
 use anyhow::Result as AnyhowResult;
 use clap::Parser;
 use tracing::info;
-use cli::{Args, Commands, handle_config_command, handle_keygen_command, handle_cert_command, handle_verify_command};
+use cli::{Args, Commands, handle_config_command, handle_keygen_command, handle_cert_command, handle_verify_command, handle_inspect_command};
 use utils::{init_logging, show_warranty, show_copying};
 
 fn main() -> AnyhowResult<()> {
@@ -76,6 +76,9 @@ fn main() -> AnyhowResult<()> {
         }
         Commands::Verify { file, timestamp_file } => {
             handle_verify_command(file, timestamp_file)?;
+        }
+        Commands::Inspect { file } => {
+            handle_inspect_command(file)?;
         }
     }
     

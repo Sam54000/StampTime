@@ -22,6 +22,7 @@ StampTime provides a single, unified interface for all timestamping operations t
 2. **`stamp keygen`** - Certificate and key generation (RFC3161 certificates and PKCS#12)
 3. **`stamp cert`** - File timestamping (single file or batch processing)
 4. **`stamp verify`** - Timestamp verification
+5. **`stamp inspect`** - Inspect timestamp responses, queries, and certificates
 
 # Quick Start
 
@@ -45,6 +46,11 @@ stamp cert --batch ./documents --output ./timestamps
 
 # 6. Verify a timestamp
 stamp verify document.pdf document.pdf.tsr
+
+# 7. Inspect timestamp files and certificates
+stamp inspect document.pdf.tsr
+stamp inspect document.pdf.tsq
+stamp inspect certificate.pem
 ```
 
 # Configuration Management (`stamp config`)
@@ -205,6 +211,7 @@ stamp <command> [options]
 - `keygen` - Certificate and key generation
 - `cert` - File timestamping
 - `verify` - Timestamp verification
+- `inspect` - Inspect timestamp responses, queries, and certificates
 
 ## `stamp config`
 
@@ -248,6 +255,68 @@ base = "./tsa_certs"
 chain_dir = "chain"
 chain_filename = "digicert_tsa_chain.pem"
 ```
+
+## `stamp inspect`
+
+**Purpose**: Inspect and display detailed information about timestamp responses, queries, and certificates
+
+**Usage**:
+```bash
+stamp inspect <file>
+```
+
+**Examples**:
+```bash
+# Inspect a timestamp response
+stamp inspect document.pdf.tsr
+
+# Inspect a timestamp query
+stamp inspect document.pdf.tsq
+
+# Inspect a certificate
+stamp inspect certificate.pem
+stamp inspect certificate.crt
+stamp inspect certificate.cer
+stamp inspect certificate.p12
+```
+
+**Supported File Types**:
+- **Timestamp Response (.tsr)** - RFC3161 timestamp response files
+- **Timestamp Query (.tsq)** - RFC3161 timestamp query files  
+- **Certificate (.pem, .crt, .cer, .p12)** - X.509 certificates in various formats
+
+**Information Displayed**:
+
+For **Timestamp Responses**:
+- Status (Granted/Denied)
+- Timestamp date and time
+- Hash algorithm used
+- Message imprint (hash)
+- TSA information
+- Accuracy and ordering details
+- Nonce value
+- Certificate information (if present)
+
+For **Timestamp Queries**:
+- Version
+- Policy
+- Hash algorithm
+- Message imprint (hash)
+- Nonce value
+- Certificate request flag
+- Extensions
+
+For **Certificates**:
+- Version
+- Serial number
+- Signature algorithm
+- Issuer information
+- Validity period (Not Before/Not After)
+- Subject information
+- Public key details
+- Key usage and extended key usage
+- Basic constraints
+- Subject alternative names
 
 ## `stamp keygen`
 
@@ -382,6 +451,11 @@ stamp cert --batch ./documents --output ./timestamps
 
 # 6. Verify a timestamp
 stamp verify document.pdf document.pdf.tsr
+
+# 7. Inspect timestamp files and certificates
+stamp inspect document.pdf.tsr
+stamp inspect document.pdf.tsq
+stamp inspect certificate.pem
 ```
 
 ## Quick Configuration Changes
