@@ -25,11 +25,12 @@ mod utils;
 mod timestamp;
 mod certificates;
 mod cli;
+mod blockchain;
 
 use anyhow::Result as AnyhowResult;
 use clap::Parser;
 use tracing::info;
-use cli::{Args, Commands, handle_config_command, handle_keygen_command, handle_cert_command, handle_verify_command, handle_inspect_command};
+use cli::{Args, Commands, handle_config_command, handle_keygen_command, handle_cert_command, handle_verify_command, handle_inspect_command, handle_blockchain_command};
 use utils::{init_logging, show_warranty, show_copying};
 
 fn main() -> AnyhowResult<()> {
@@ -74,11 +75,14 @@ fn main() -> AnyhowResult<()> {
         } => {
             handle_cert_command(input, output, batch, tsa_url, tsa_cert, no_verify, recursive, dry_run, re_timestamp, use_git, verbose, cleanup)?;
         }
-        Commands::Verify { file, timestamp_file } => {
-            handle_verify_command(file, timestamp_file)?;
+        Commands::Verify { file, timestamp_file, query_file, tsa_cert, hash_only } => {
+            handle_verify_command(file, timestamp_file, query_file, tsa_cert, hash_only)?;
         }
         Commands::Inspect { file } => {
             handle_inspect_command(file)?;
+        }
+        Commands::Blockchain { action } => {
+            handle_blockchain_command(action)?;
         }
     }
     

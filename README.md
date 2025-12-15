@@ -504,6 +504,55 @@ chain_dir = "chain"
 chain_filename = "digicert_tsa_chain.pem"
 ```
 
+# Blockchain Anchoring (Ultra-Solid Legal Timestamps)
+
+For maximum legal protection, StampTime now supports **blockchain anchoring** via OpenTimestamps. This creates a "belt and suspenders" approach with two independent proofs:
+
+1. **RFC 3161** - Legally recognized, immediate verification
+2. **Bitcoin Blockchain** - Decentralized, immutable, permanent
+
+## Quick Start
+
+```bash
+# Install OpenTimestamps client
+pip3 install opentimestamps-client
+
+# Create both timestamps in one command
+stamp blockchain anchor document.pdf --with-rfc3161
+
+# Wait 1-24 hours for Bitcoin confirmation, then upgrade
+stamp blockchain upgrade document.pdf.ots
+
+# Verify both proofs
+stamp blockchain verify-anchor document.pdf --with-rfc3161
+
+# Generate evidence package manifest
+stamp blockchain bundle document.pdf
+```
+
+## Available Blockchain Commands
+
+```bash
+stamp blockchain anchor <file>           # Create blockchain timestamp
+stamp blockchain verify-anchor <file>    # Verify blockchain timestamp
+stamp blockchain upgrade <ots_file>      # Upgrade after Bitcoin confirmation
+stamp blockchain info <ots_file>         # Show OTS proof details
+stamp blockchain bundle <file>           # Generate proof bundle manifest
+stamp blockchain explain                 # Learn about blockchain timestamping
+```
+
+## Why Blockchain Anchoring?
+
+| Aspect | RFC 3161 Alone | + Blockchain |
+|--------|----------------|--------------|
+| Trust Model | Centralized TSA | Decentralized (thousands of nodes) |
+| Single Point of Failure | TSA could cease | No single point |
+| Tampering | TSA compromise risk | Would require 51% attack |
+| Verification | Needs TSA access | Anyone can verify |
+| Legal Recognition | Established | Emerging (El Salvador official use) |
+
+See `LEGAL_EVIDENCE_GUIDE.md` for comprehensive legal documentation.
+
 # Help and Documentation
 
 Get help for any command:
@@ -514,8 +563,11 @@ stamp keygen --help
 stamp keygen pkcs12 --help
 stamp cert --help
 stamp verify --help
+stamp blockchain --help
 ```
 
 # Future Implementation
 - Batch Verify
 - Try with other TSA
+- Ethereum anchoring option
+- Long-term validation (LTV) for archival

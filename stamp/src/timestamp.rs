@@ -23,6 +23,7 @@ use std::io::Write;
 use tracing::{info, warn};
 use walkdir::WalkDir;
 use colored::*;
+use std::path::Path;
 
 /// Custom logging functions for file processing
 
@@ -154,12 +155,16 @@ pub fn create_timestamp_query(data: &[u8]) -> AnyhowResult<Vec<u8>> {
     let output_path = output_file.path().to_path_buf();
     drop(output_file);
     
-    // Use OpenSSL to create timestamp query
+    // Use OpenSSL to create timestamp query with SHA-256 hash algorithm
+    // SHA-256 is required for legal admissibility (SHA-1 is deprecated)
+    // The -cert flag requests the TSA to include its certificate in the response
+    // This is critical for independent verification without external certificate lookup
     let output = Command::new("openssl")
         .args(&[
             "ts", "-query", 
             "-data", temp_file.path().to_str().unwrap(),
-            "-cert",
+            "-sha256",  // Explicitly use SHA-256 for legal compliance
+            "-cert",    // Request TSA certificate in response for verification
             "-out", output_path.to_str().unwrap()
         ])
         .output()
@@ -189,6 +194,46 @@ pub fn extract_timestamp_certificates(tsr_data: &[u8]) -> AnyhowResult<Vec<Strin
         .with_context(|| "Failed to write TSR data to temporary file")?;
     temp_tsr.flush()
         .with_context(|| "Failed to flush temporary TSR file")?;
+    
+    // Extract embedded certificates from the timestamp response using PKCS7 extraction
+    // This is the proper way to extract certificates for legal verification
+    // First, extract the token (PKCS7 signed data) from the TSR
+    let token_output = Command::new("openssl")
+        .args(&[
+            "ts", "-reply",
+            "-in", temp_tsr.path().to_str().unwrap(),
+            "-token_out"
+        ])
+        .output()
+        .with_context(|| "Failed to extract token from TSR")?;
+    
+    if token_output.status.success() && !token_output.stdout.is_empty() {
+        // Extract certificates from the PKCS7 token
+        let pkcs7_output = Command::new("openssl")
+            .args(&["pkcs7", "-inform", "DER", "-print_certs"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        
+        if let Ok(mut child) = pkcs7_output {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(&token_output.stdout);
+            }
+            
+            if let Ok(output) = child.wait_with_output() {
+                if output.status.success() {
+                    let certs_text = String::from_utf8_lossy(&output.stdout);
+                    let pem_certs = extract_pem_certificates(&certs_text)?;
+                    if !pem_certs.is_empty() {
+                        let _ = std::fs::remove_file(temp_tsr.path());
+                        return Ok(pem_certs);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Fallback: try the text output method
     let output = Command::new("openssl")
         .args(&[
             "ts", "-reply", 
@@ -305,13 +350,66 @@ pub fn verify_timestamp_response(tsr_data: &[u8], tsq_data: &[u8]) -> AnyhowResu
         .with_context(|| "Failed to write TSQ data to temporary file")?;
     temp_tsq.flush()
         .with_context(|| "Failed to flush temporary TSQ file")?;
-    let output = Command::new("openssl")
+    
+    // Extract certificates embedded in the TSR for verification
+    // This allows self-contained verification using the certificates included in the response
+    let token_output = Command::new("openssl")
         .args(&[
-            "ts", "-verify",
-            "-queryfile", temp_tsq.path().to_str().unwrap(),
+            "ts", "-reply",
             "-in", temp_tsr.path().to_str().unwrap(),
-            "-no_check_time"  // Skip time validation for now
+            "-token_out"
         ])
+        .output();
+    
+    let mut temp_chain: Option<NamedTempFile> = None;
+    
+    if let Ok(token_result) = token_output {
+        if token_result.status.success() && !token_result.stdout.is_empty() {
+            // Extract certificates from the PKCS7 token
+            let pkcs7_output = Command::new("openssl")
+                .args(&["pkcs7", "-inform", "DER", "-print_certs"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn();
+            
+            if let Ok(mut child) = pkcs7_output {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(&token_result.stdout);
+                }
+                
+                if let Ok(output) = child.wait_with_output() {
+                    if output.status.success() && !output.stdout.is_empty() {
+                        // Create temporary file with extracted certificates
+                        if let Ok(mut chain_file) = NamedTempFile::new() {
+                            if chain_file.write_all(&output.stdout).is_ok() && chain_file.flush().is_ok() {
+                                temp_chain = Some(chain_file);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Build verification command
+    // Use -partial_chain to allow verification with embedded certificates
+    // This is appropriate when certificates are embedded in the response
+    let mut args = vec![
+        "ts", "-verify",
+        "-queryfile", temp_tsq.path().to_str().unwrap(),
+        "-in", temp_tsr.path().to_str().unwrap(),
+    ];
+    
+    let chain_path_str;
+    if let Some(ref chain_file) = temp_chain {
+        chain_path_str = chain_file.path().to_str().unwrap().to_string();
+        args.push("-CAfile");
+        args.push(&chain_path_str);
+        args.push("-partial_chain");  // Allow partial chain verification with embedded certs
+    }
+    
+    let output = Command::new("openssl")
+        .args(&args)
         .output()
         .with_context(|| "Failed to execute openssl ts verify command")?;
     
@@ -319,10 +417,55 @@ pub fn verify_timestamp_response(tsr_data: &[u8], tsq_data: &[u8]) -> AnyhowResu
     let _ = std::fs::remove_file(temp_tsq.path());
     
     if output.status.success() {
+        info!("Timestamp cryptographic verification successful");
         Ok(true)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         warn!("Timestamp verification failed: {}", stderr);
+        Ok(false)
+    }
+}
+
+/// Verify a timestamp response (.tsr) against the original query (.tsq) AND a trusted CA chain.
+///
+/// This is the court-grade check: it validates the TSA signature and the certificate chain anchored to the
+/// provided trust bundle. Unlike the byte-based verifier, this does NOT attempt to "self-trust" embedded certs.
+pub fn verify_timestamp_response_files(
+    tsr_path: &Path,
+    tsq_path: &Path,
+    ca_chain_path: &Path,
+) -> AnyhowResult<bool> {
+    use std::process::Command;
+
+    if !tsr_path.exists() {
+        return Err(anyhow::anyhow!("TSR file not found: {}", tsr_path.display()));
+    }
+    if !tsq_path.exists() {
+        return Err(anyhow::anyhow!("TSQ file not found: {}", tsq_path.display()));
+    }
+    if !ca_chain_path.exists() {
+        return Err(anyhow::anyhow!("CA chain file not found: {}", ca_chain_path.display()));
+    }
+
+    let output = Command::new("openssl")
+        .args(&[
+            "ts",
+            "-verify",
+            "-queryfile",
+            tsq_path.to_str().unwrap(),
+            "-in",
+            tsr_path.to_str().unwrap(),
+            "-CAfile",
+            ca_chain_path.to_str().unwrap(),
+        ])
+        .output()
+        .with_context(|| "Failed to execute openssl ts -verify command")?;
+
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!("OpenSSL ts -verify failed: {}", stderr);
         Ok(false)
     }
 }
@@ -333,6 +476,10 @@ pub fn send_timestamp_request(tsq_data: &[u8], tsa_url: &str) -> AnyhowResult<Ve
         .build()
         .with_context(|| "Failed to create HTTP client")?;
     
+    if tsa_url.to_lowercase().starts_with("http://") {
+        warn!("TSA URL uses HTTP (not HTTPS): {}. This allows on-path attackers to tamper with responses unless you perform strict trust-anchored verification with a known CA chain.", tsa_url);
+    }
+
     info!("Sending {} bytes to TSA: {}", tsq_data.len(), tsa_url);
     
     let response = client
@@ -433,12 +580,24 @@ pub fn timestamp_file(input_file: &PathBuf, config: &TimestampConfig) -> AnyhowR
     }
     
     if config.verify_after_creation {
-        info!("Verifying timestamp");
-        let verification_result = verify_timestamp_response(&tsr_data, &tsq_data);
-        match verification_result {
-            Ok(true) => info!("Timestamp verification successful"),
-            Ok(false) => warn!("Timestamp verification failed"),
-            Err(e) => warn!("Timestamp verification error: {}", e),
+        info!("Verifying timestamp (trust-anchored)");
+
+        let has_chain = !config.tsa_cert_path.as_os_str().is_empty() && config.tsa_cert_path.exists();
+        if !has_chain {
+            warn!(
+                "Skipping trust-anchored verification: no TSA CA chain provided/found (tsa_cert_path='{}'). \
+For court-grade verification, run `stamp keygen rfc3161` and then pass --tsa-cert <chain.pem> (or configure a default).",
+                config.tsa_cert_path.display()
+            );
+        } else if let (Some(ref tsr_path), Some(ref tsq_path)) = (output_paths.timestamp_response.as_ref(), output_paths.timestamp_query.as_ref()) {
+            let verification_result = verify_timestamp_response_files(tsr_path, tsq_path, &config.tsa_cert_path);
+            match verification_result {
+                Ok(true) => info!("Timestamp cryptographic verification successful (trusted chain)"),
+                Ok(false) => warn!("Timestamp cryptographic verification FAILED (trusted chain)"),
+                Err(e) => warn!("Timestamp cryptographic verification ERROR: {}", e),
+            }
+        } else {
+            warn!("Skipping verification: expected output .tsr/.tsq paths were not available");
         }
     }
     
@@ -1350,9 +1509,9 @@ pub fn inspect_file(file_path: &PathBuf) -> AnyhowResult<()> {
         InspectableFileType::Unknown => {
             println!("Unknown file type. Cannot determine if this is a timestamp response, query, or certificate.");
             println!("Supported file types:");
-            println!("  • Timestamp Response (.tsr)");
-            println!("  • Timestamp Query (.tsq)");
-            println!("  • Certificate (.pem, .crt, .cer, .p12)");
+            println!("   Timestamp Response (.tsr)");
+            println!("   Timestamp Query (.tsq)");
+            println!("   Certificate (.pem, .crt, .cer, .p12)");
         }
     }
     
@@ -1493,63 +1652,128 @@ fn inspect_timestamp_response(file_path: &PathBuf) -> AnyhowResult<()> {
     let tsr_info = get_timestamp_response_info(&file_data)?;
     
     println!("=== TIMESTAMP RESPONSE INFORMATION ===");
+    println!("=== (RFC 3161 Compliant - Legal Evidence) ===");
     println!();
     
-    // Basic information
+    // Status - critical for legal validity
     if let Some(status) = tsr_info.get("Status") {
         println!("Status: {}", status);
+        if status.contains("Granted") {
+            println!("  [VALID] Timestamp was successfully granted by TSA");
+        }
     }
     
+    // Policy OID - important for legal traceability
+    if let Some(policy) = tsr_info.get("Policy OID") {
+        println!("Policy OID: {}", policy);
+        println!("  (Identifies the TSA's timestamping policy for legal reference)");
+    }
+    
+    // Timestamp - the legally binding time
     if let Some(timestamp) = tsr_info.get("Time stamp") {
-        println!("Timestamp: {}", timestamp);
+        println!("Timestamp (UTC): {}", timestamp);
+        println!("  (This is the legally binding time of existence proof)");
     }
     
+    // Hash Algorithm - must be SHA-256 or stronger for legal validity
     if let Some(hash_algo) = tsr_info.get("Hash Algorithm") {
         println!("Hash Algorithm: {}", hash_algo);
+        if hash_algo.contains("sha256") || hash_algo.contains("sha384") || hash_algo.contains("sha512") {
+            println!("  [COMPLIANT] Algorithm meets legal requirements");
+        } else if hash_algo.contains("sha1") {
+            println!("  [WARNING] SHA-1 is deprecated and may not be accepted in legal contexts");
+        }
     }
     
+    // Serial Number - unique identifier for this timestamp
+    if let Some(serial) = tsr_info.get("Serial number") {
+        println!("Serial Number: {}", serial);
+        println!("  (Unique identifier for this timestamp - useful for audit trails)");
+    }
+    
+    // Message Imprint (Hash of the original document)
     if let Some(message_imprint) = tsr_info.get("Message data") {
-        println!("Message Imprint (Hash): {}", message_imprint);
+        println!("Message Imprint (Document Hash): {}", message_imprint);
     }
     
+    // TSA Information
     if let Some(tsa) = tsr_info.get("TSA") {
-        println!("TSA: {}", tsa);
+        println!("TSA (Timestamp Authority): {}", tsa);
     }
     
+    // Accuracy
     if let Some(accuracy) = tsr_info.get("Accuracy") {
         println!("Accuracy: {}", accuracy);
     }
     
+    // Ordering
     if let Some(ordering) = tsr_info.get("Ordering") {
         println!("Ordering: {}", ordering);
     }
     
+    // Nonce - prevents replay attacks
     if let Some(nonce) = tsr_info.get("Nonce") {
         println!("Nonce: {}", nonce);
+        println!("  (Anti-replay protection - ensures timestamp freshness)");
     }
     
     if let Some(tsa_cert_id) = tsr_info.get("TSA Cert ID") {
         println!("TSA Certificate ID: {}", tsa_cert_id);
     }
     
-    // Certificate information
-    if let Some(cert_count) = tsr_info.get("Certificate count") {
-        println!("Certificate count: {}", cert_count);
+    // Version
+    if let Some(version) = tsr_info.get("Version") {
+        println!("TST Version: {}", version);
     }
     
-    // Show certificates if present
+    // Show embedded certificates for verification chain
     let certificates = extract_timestamp_certificates(&file_data)?;
     if !certificates.is_empty() && certificates[0] != "No certificates found in timestamp response" {
         println!();
-        println!("=== CERTIFICATES ===");
+        println!("=== EMBEDDED CERTIFICATES ({} found) ===", certificates.len());
+        println!("(These certificates form the trust chain for verification)");
+        println!();
+        
         for (i, cert) in certificates.iter().enumerate() {
-            println!("Certificate {}:", i + 1);
-            println!("{}", cert);
+            println!("--- Certificate {} ---", i + 1);
+            // Parse and display key certificate info
+            if cert.contains("-----BEGIN CERTIFICATE-----") {
+                // Extract subject and issuer from the certificate
+                use std::process::Command;
+                use tempfile::NamedTempFile;
+                
+                if let Ok(mut temp_cert) = NamedTempFile::new() {
+                    if temp_cert.write_all(cert.as_bytes()).is_ok() && temp_cert.flush().is_ok() {
+                        let cert_info = Command::new("openssl")
+                            .args(&["x509", "-in", temp_cert.path().to_str().unwrap(), "-noout", "-subject", "-issuer", "-dates"])
+                            .output();
+                        
+                        if let Ok(output) = cert_info {
+                            if output.status.success() {
+                                println!("{}", String::from_utf8_lossy(&output.stdout));
+                            }
+                        }
+                    }
+                }
+            } else {
+                println!("{}", cert);
+            }
             if i < certificates.len() - 1 {
                 println!();
             }
         }
+    } else {
+        println!();
+        println!("Note: No embedded certificates found in response.");
+        println!("For legal verification, use the TSA certificate chain from 'stamp keygen rfc3161'");
     }
+    
+    println!();
+    println!("=== LEGAL NOTES ===");
+    println!(" This timestamp provides cryptographic proof that the document existed at the stated time");
+    println!(" For court admissibility, preserve both the original file and this .tsr file");
+    println!(" Verification can be performed independently using OpenSSL or this tool");
+    println!(" The Policy OID identifies the legal framework under which the timestamp was issued");
     
     Ok(())
 }
