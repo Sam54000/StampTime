@@ -30,7 +30,7 @@ mod blockchain;
 use anyhow::Result as AnyhowResult;
 use clap::Parser;
 use tracing::info;
-use cli::{Args, Commands, handle_config_command, handle_keygen_command, handle_cert_command, handle_verify_command, handle_inspect_command, handle_blockchain_command};
+use cli::{Args, Commands, handle_init_command, handle_config_command, handle_keygen_command, handle_cert_command, handle_verify_command, handle_inspect_command, handle_blockchain_command};
 use utils::{init_logging, show_warranty, show_copying};
 
 fn main() -> AnyhowResult<()> {
@@ -47,8 +47,11 @@ fn main() -> AnyhowResult<()> {
     info!("Starting StampTime RFC3161 timestamping tool");
     
     match args.command {
-        Commands::Config { key, value } => {
-            handle_config_command(key, value)?;
+        Commands::Init { skip_certs, force } => {
+            handle_init_command(skip_certs, force)?;
+        }
+        Commands::Config { key, value, tsa_path, tsa_url, show } => {
+            handle_config_command(key, value, tsa_path, tsa_url, show)?;
         }
         Commands::ShowWarranty => {
             show_warranty();
@@ -102,7 +105,7 @@ mod tests {
         temp_file.write_all(pdf_data).unwrap();
         
         let input_file = temp_file.path().to_path_buf();
-        let _config = timestamp::TimestampConfig::new("http://timestamp.digicert.com".to_string());
+        let _config = timestamp::TimestampConfig::new("https://timestamp.digicert.com".to_string());
         
         let pdf_data_read = std::fs::read(&input_file).unwrap();
         assert_eq!(pdf_data_read, pdf_data);

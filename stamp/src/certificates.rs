@@ -27,22 +27,37 @@ use crate::utils::get_password_interactive;
 pub fn download_rfc3161_certificates() -> AnyhowResult<()> {
     info!("Downloading RFC3161 certificates...");
     
-    let config_path = PathBuf::from("config.toml");
-    let config_file = if config_path.exists() {
-        Some(crate::config::load_config_file(&config_path)?)
+    // Try to load config from default location ($HOME/.config/stamp/stamp.conf)
+    let config_file = if let Ok(config_path) = crate::config::get_config_file_path() {
+        if config_path.exists() {
+            Some(crate::config::load_config_file(&config_path)?)
+        } else {
+            // Fallback to local config.toml for backwards compatibility
+            let local_config = PathBuf::from("config.toml");
+            if local_config.exists() {
+                Some(crate::config::load_config_file(&local_config)?)
+            } else {
+                None
+            }
+        }
     } else {
         None
     };
     
+    // Determine the base directory for certificates
     let workdir = if let Some(ref config) = config_file {
         PathBuf::from(&config.path.base)
     } else {
-        std::env::var("WORKDIR")
-            .map(PathBuf::from)
+        // Use default TSA certs directory if no config exists
+        crate::config::get_default_tsa_certs_dir()
             .unwrap_or_else(|_| {
-                std::env::var("HOME")
-                    .map(|home| PathBuf::from(home).join("docs"))
-                    .unwrap_or_else(|_| PathBuf::from("."))
+                std::env::var("WORKDIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        std::env::var("HOME")
+                            .map(|home| PathBuf::from(home).join(".config").join("stamp").join("tsa_certs"))
+                            .unwrap_or_else(|_| PathBuf::from("./tsa_certs"))
+                    })
             })
     };
     
@@ -445,7 +460,28 @@ fn create_pkcs12_file(
     password: &str
 ) -> AnyhowResult<()> {
     use std::process::Command;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     
+    // Create a temporary file for the password to avoid exposing it in process list
+    let mut temp_pass_file = tempfile::NamedTempFile::new()
+        .with_context(|| "Failed to create temporary password file")?;
+    
+    // Write password to temporary file
+    temp_pass_file.write_all(password.as_bytes())
+        .with_context(|| "Failed to write password to temporary file")?;
+    temp_pass_file.flush()
+        .with_context(|| "Failed to flush password file")?;
+    
+    // Set restrictive permissions (read/write for owner only)
+    let mut perms = fs::metadata(temp_pass_file.path())?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(temp_pass_file.path(), perms)
+        .with_context(|| "Failed to set permissions on password file")?;
+    
+    let pass_file_path = temp_pass_file.path().to_path_buf();
+    
+    // Use file: option instead of pass: to avoid password in command line
     let output = Command::new("openssl")
         .args(&[
             "pkcs12",
@@ -453,10 +489,13 @@ fn create_pkcs12_file(
             "-out", p12_path.to_str().unwrap(),
             "-inkey", key_path.to_str().unwrap(),
             "-in", cert_path.to_str().unwrap(),
-            "-passout", &format!("pass:{}", password)
+            "-passout", &format!("file:{}", pass_file_path.to_str().unwrap())
         ])
         .output()
         .with_context(|| "Failed to execute openssl pkcs12 command")?;
+    
+    // Immediately remove the temporary password file
+    drop(temp_pass_file);
     
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

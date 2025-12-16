@@ -1,5 +1,5 @@
 [tsa]
-url = "http://timestamp.digicert.com"
+url = "https://timestamp.digicert.com"
 
 [certificates]
 sha256_responder = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertSHA256RSA4096TimestampResponder20251.cer"
@@ -9,6 +9,6 @@ intermediate = "https://knowledge.digicert.com/content/dam/kb/attachments/time-s
 root = "https://knowledge.digicert.com/content/dam/kb/attachments/time-stamp/DigiCertTrustedRootG4.cer"
 
 [path]
-base = "./tsa_cert"
+base = "~/.config/stamp/tsa_certs"
 chain_dir = "chain"
 chain_filename = "digicert_tsa_chain.pem"

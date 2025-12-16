@@ -21,10 +21,33 @@ use anyhow::{Context, Result as AnyhowResult};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
-use crate::config::{self, load_config_file, find_default_tsa_cert};
+use crate::config::{self, load_config_file, find_default_tsa_cert, get_config_file_path, get_config_dir, get_default_tsa_certs_dir, is_initialized, initialize_config_dir, TsaConfigFile};
 use crate::timestamp::{self, TimestampConfig, process_directory_batch, BatchResult};
 use crate::certificates::{download_rfc3161_certificates, generate_pkcs12_certificate};
 use crate::blockchain;
+
+/// Load configuration from the default location or local fallback.
+/// Returns None if no config file exists.
+fn load_app_config() -> Option<TsaConfigFile> {
+    // Try default location first ($HOME/.config/stamp/stamp.conf)
+    if let Ok(config_path) = get_config_file_path() {
+        if config_path.exists() {
+            if let Ok(config) = load_config_file(&config_path) {
+                return Some(config);
+            }
+        }
+    }
+    
+    // Fallback to local config.toml for backwards compatibility
+    let local_config = PathBuf::from("config.toml");
+    if local_config.exists() {
+        if let Ok(config) = load_config_file(&local_config) {
+            return Some(config);
+        }
+    }
+    
+    None
+}
 
 /// StampTime - RFC3161 Timestamping Tool
 #[derive(Parser)]
@@ -47,11 +70,34 @@ pub struct Args {
 /// Available subcommands
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Initialize stamp configuration and download TSA certificates
+    Init {
+        /// Skip downloading certificates (only create config)
+        #[arg(long, help = "Skip downloading TSA certificates")]
+        skip_certs: bool,
+        
+        /// Force re-initialization even if already initialized
+        #[arg(long, short, help = "Force re-initialization")]
+        force: bool,
+    },
+    /// View or modify configuration
     Config {
         /// Configuration key (e.g., 'tsa.url', 'certificates.sha256_responder')
         key: Option<String>,
         /// Configuration value
         value: Option<String>,
+        
+        /// Set the TSA certificates directory path
+        #[arg(long, help = "Set the path where TSA certificates are stored")]
+        tsa_path: Option<String>,
+        
+        /// Set the TSA server URL
+        #[arg(long, help = "Set the TSA server URL")]
+        tsa_url: Option<String>,
+        
+        /// Show the current configuration
+        #[arg(long, help = "Display the current configuration")]
+        show: bool,
     },
     /// Show warranty information
     #[command(name = "show w")]
@@ -207,6 +253,22 @@ pub enum BlockchainAction {
         /// Output path for the JSON manifest
         #[arg(long, help = "Output path for the proof bundle manifest")]
         output: Option<PathBuf>,
+        
+        /// Include only RFC 3161 timestamp (no blockchain)
+        #[arg(long, help = "Create bundle with RFC 3161 timestamp only")]
+        rfc3161_only: bool,
+        
+        /// Include only blockchain timestamp (no RFC 3161)
+        #[arg(long, help = "Create bundle with blockchain timestamp only")]
+        blockchain_only: bool,
+        
+        /// TSA URL for RFC 3161 timestamp
+        #[arg(long, help = "TSA URL for RFC 3161 timestamp")]
+        tsa_url: Option<String>,
+        
+        /// TSA certificate path for RFC 3161 verification
+        #[arg(long, help = "Path to TSA certificate chain")]
+        tsa_cert: Option<PathBuf>,
     },
 }
 
@@ -242,10 +304,93 @@ pub enum KeygenType {
     },
 }
 
-pub fn handle_config_command(key: Option<String>, value: Option<String>) -> AnyhowResult<()> {
+/// Handle the init command - initialize stamp configuration and download certificates
+pub fn handle_init_command(skip_certs: bool, force: bool) -> AnyhowResult<()> {
+    println!("=== StampTime Initialization ===");
+    println!();
+    
+    // Check if already initialized
+    if is_initialized() && !force {
+        let config_dir = get_config_dir()?;
+        println!("Stamp is already initialized at: {}", config_dir.display());
+        println!();
+        println!("Configuration file: {}", get_config_file_path()?.display());
+        println!("TSA certificates:   {}", get_default_tsa_certs_dir()?.display());
+        println!();
+        println!("Use --force to re-initialize and overwrite existing configuration.");
+        return Ok(());
+    }
+    
+    // Show license notice
+    println!("stamp  Copyright (C) 2025 Dr. Samuel Louviot, Ph.D");
+    println!("This program comes with ABSOLUTELY NO WARRANTY; for details type 'stamp show w'.");
+    println!("This is free software, and you are welcome to redistribute it");
+    println!("under certain conditions; type 'stamp show c' for details.");
+    println!();
+    
+    // Initialize config directory
+    let config_dir = initialize_config_dir()?;
+    println!("Created configuration directory: {}", config_dir.display());
+    println!("Configuration file: {}", get_config_file_path()?.display());
+    
+    // Download certificates unless skipped
+    if !skip_certs {
+        println!();
+        println!("Downloading TSA certificates...");
+        download_rfc3161_certificates()?;
+        println!("TSA certificates downloaded to: {}", get_default_tsa_certs_dir()?.display());
+    } else {
+        println!();
+        println!("Skipping certificate download (use 'stamp keygen rfc3161' to download later)");
+    }
+    
+    println!();
+    println!("=== Initialization Complete ===");
+    println!();
+    println!("You can now use stamp to timestamp files:");
+    println!("  stamp cert <file>           - Timestamp a single file");
+    println!("  stamp cert <dir> --batch    - Timestamp all files in a directory");
+    println!("  stamp verify <file> <tsr>   - Verify a timestamp");
+    println!();
+    println!("Configuration can be modified with:");
+    println!("  stamp config                - Interactive configuration");
+    println!("  stamp config <key> <value>  - Set a specific value");
+    println!();
+    
+    Ok(())
+}
+
+pub fn handle_config_command(
+    key: Option<String>,
+    value: Option<String>,
+    tsa_path: Option<String>,
+    tsa_url: Option<String>,
+    show: bool,
+) -> AnyhowResult<()> {
+    // Handle --show flag
+    if show {
+        return show_current_config();
+    }
+    
+    // Handle --tsa-path flag
+    if let Some(path) = tsa_path {
+        config::set_config_value("path.base", &path)?;
+        println!("TSA certificates path set to: {}", path);
+        return Ok(());
+    }
+    
+    // Handle --tsa-url flag
+    if let Some(url) = tsa_url {
+        config::set_config_value("tsa.url", &url)?;
+        println!("TSA server URL set to: {}", url);
+        return Ok(());
+    }
+    
+    // Handle key/value pairs
     match (key, value) {
         (Some(k), Some(v)) => {
             config::set_config_value(&k, &v)?;
+            println!("Configuration updated: {} = {}", k, v);
         }
         (Some(k), None) => {
             config::get_config_value(&k)?;
@@ -257,6 +402,43 @@ pub fn handle_config_command(key: Option<String>, value: Option<String>) -> Anyh
             return Err(anyhow::anyhow!("Cannot set value without specifying key"));
         }
     }
+    Ok(())
+}
+
+/// Display the current configuration
+fn show_current_config() -> AnyhowResult<()> {
+    let config_path = get_config_file_path()?;
+    
+    if !config_path.exists() {
+        println!("No configuration file found at: {}", config_path.display());
+        println!("Run 'stamp init' to initialize stamp.");
+        return Ok(());
+    }
+    
+    let config = load_config_file(&config_path)?;
+    
+    println!("=== StampTime Configuration ===");
+    println!("Config file: {}", config_path.display());
+    println!();
+    println!("[tsa]");
+    println!("  url = {}", config.tsa.url);
+    println!();
+    println!("[path]");
+    println!("  base = {}", config.path.base);
+    println!("  chain_dir = {}", config.path.chain_dir);
+    println!("  chain_filename = {}", config.path.chain_filename);
+    println!();
+    println!("[certificates]");
+    println!("  sha256_responder = {}", config.certificates.sha256_responder);
+    if let Some(ref url) = config.certificates.sha384_responder {
+        println!("  sha384_responder = {}", url);
+    }
+    if let Some(ref url) = config.certificates.sha512_responder {
+        println!("  sha512_responder = {}", url);
+    }
+    println!("  intermediate = {}", config.certificates.intermediate);
+    println!("  root = {}", config.certificates.root);
+    
     Ok(())
 }
 
@@ -463,30 +645,41 @@ fn handle_single_file_timestamping(
     tsa_cert: Option<PathBuf>,
     no_verify: bool,
 ) -> AnyhowResult<()> {
+    // Validate input path to prevent command injection
+    crate::timestamp::validate_file_path(&input)
+        .map_err(|e| anyhow::anyhow!("Invalid input file path: {}", e))?;
+    
     info!("Input file: {}", input.display());
     
     if !input.exists() {
-        error!("Input file does not exist: {}", input.display());
+        error!("Input file does not exist");
         std::process::exit(1);
     }
     
     if !input.is_file() {
-        error!("Input path is not a file: {}", input.display());
+        error!("Input path is not a file");
         std::process::exit(1);
     }
     
-    let config_path = PathBuf::from("config.toml");
-    let config_file = if config_path.exists() {
-        Some(load_config_file(&config_path)?)
-    } else {
-        None
-    };
+    // Validate output path if provided
+    if let Some(ref out) = output {
+        crate::timestamp::validate_file_path(out)
+            .map_err(|e| anyhow::anyhow!("Invalid output path: {}", e))?;
+    }
+    
+    // Validate TSA cert path if provided
+    if let Some(ref cert) = tsa_cert {
+        crate::timestamp::validate_file_path(cert)
+            .map_err(|e| anyhow::anyhow!("Invalid TSA certificate path: {}", e))?;
+    }
+    
+    let config_file = load_app_config();
     
     let tsa_url = tsa_url.unwrap_or_else(|| {
         if let Some(ref config) = config_file {
             config.tsa.url.clone()
         } else {
-            "http://timestamp.digicert.com".to_string()
+            "https://timestamp.digicert.com".to_string()
         }
     });
     
@@ -568,18 +761,13 @@ fn handle_batch_timestamping(
             .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
     }
     
-    let config_path = PathBuf::from("config.toml");
-    let config_file = if config_path.exists() {
-        Some(load_config_file(&config_path)?)
-    } else {
-        None
-    };
+    let config_file = load_app_config();
     
     let tsa_url = tsa_url.unwrap_or_else(|| {
         if let Some(ref config) = config_file {
             config.tsa.url.clone()
         } else {
-            "http://timestamp.digicert.com".to_string()
+            "https://timestamp.digicert.com".to_string()
         }
     });
     
@@ -626,8 +814,8 @@ pub fn handle_blockchain_command(action: BlockchainAction) -> AnyhowResult<()> {
         BlockchainAction::Explain => {
             blockchain::print_blockchain_info();
         }
-        BlockchainAction::Bundle { file, output } => {
-            handle_proof_bundle(file, output)?;
+        BlockchainAction::Bundle { file, output, rfc3161_only, blockchain_only, tsa_url, tsa_cert } => {
+            handle_proof_bundle(file, output, rfc3161_only, blockchain_only, tsa_url, tsa_cert)?;
         }
     }
     Ok(())
@@ -658,18 +846,13 @@ fn handle_blockchain_anchor(
     if with_rfc3161 {
         println!("Step 1: Creating RFC 3161 timestamp (for legal recognition)...");
         
-        let config_path = PathBuf::from("config.toml");
-        let config_file = if config_path.exists() {
-            Some(load_config_file(&config_path)?)
-        } else {
-            None
-        };
+        let config_file = load_app_config();
         
         let tsa_url = tsa_url.unwrap_or_else(|| {
             if let Some(ref config) = config_file {
                 config.tsa.url.clone()
             } else {
-                "http://timestamp.digicert.com".to_string()
+                "https://timestamp.digicert.com".to_string()
             }
         });
         
@@ -913,44 +1096,189 @@ fn handle_blockchain_info(ots_file: PathBuf) -> AnyhowResult<()> {
     Ok(())
 }
 
-fn handle_proof_bundle(file: PathBuf, output: Option<PathBuf>) -> AnyhowResult<()> {
+fn handle_proof_bundle(
+    file: PathBuf,
+    output: Option<PathBuf>,
+    rfc3161_only: bool,
+    blockchain_only: bool,
+    tsa_url: Option<String>,
+    tsa_cert: Option<PathBuf>,
+) -> AnyhowResult<()> {
     if !file.exists() {
         error!("File does not exist: {}", file.display());
         std::process::exit(1);
     }
     
-    println!("Generating proof bundle manifest for: {}", file.display());
+    if rfc3161_only && blockchain_only {
+        error!("Cannot use both --rfc3161-only and --blockchain-only flags");
+        std::process::exit(1);
+    }
     
-    // Look for existing proof files
-    let tsr_path = PathBuf::from(format!("{}.tsr", file.file_stem().unwrap().to_str().unwrap()));
-    let tsq_path = PathBuf::from(format!("{}.tsq", file.file_stem().unwrap().to_str().unwrap()));
+    let include_rfc3161 = !blockchain_only;
+    let include_blockchain = !rfc3161_only;
     
-    let rfc3161_tsr = if tsr_path.exists() { Some(tsr_path.as_path()) } else { None };
-    let rfc3161_tsq = if tsq_path.exists() { Some(tsq_path.as_path()) } else { None };
+    let mode_str = if rfc3161_only {
+        "RFC 3161 only"
+    } else if blockchain_only {
+        "Blockchain only"
+    } else {
+        "RFC 3161 + Blockchain (combined)"
+    };
     
-    match blockchain::create_combined_proof_bundle(&file, rfc3161_tsr, rfc3161_tsq, false) {
+    println!("\n=== CREATING PROOF BUNDLE ({}) ===\n", mode_str);
+    println!("File: {}", file.display());
+    
+    let output_dir = file.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
+    let file_stem = file.file_stem().unwrap().to_str().unwrap();
+    
+    let mut rfc3161_tsr: Option<PathBuf> = None;
+    let mut rfc3161_tsq: Option<PathBuf> = None;
+    
+    if include_rfc3161 {
+        let tsr_path = output_dir.join(format!("{}.tsr", file_stem));
+        let tsq_path = output_dir.join(format!("{}.tsq", file_stem));
+        
+        if tsr_path.exists() && tsq_path.exists() {
+            println!("Found existing RFC 3161 timestamp files");
+            rfc3161_tsr = Some(tsr_path);
+            rfc3161_tsq = Some(tsq_path);
+        } else {
+            println!("Creating RFC 3161 timestamp...");
+            
+            let config_file = load_app_config();
+            
+            let tsa_url = tsa_url.unwrap_or_else(|| {
+                if let Some(ref config) = config_file {
+                    config.tsa.url.clone()
+                } else {
+                    "https://timestamp.digicert.com".to_string()
+                }
+            });
+            
+            let tsa_cert_path = tsa_cert
+                .or_else(|| find_default_tsa_cert())
+                .unwrap_or_default();
+            
+            let config = TimestampConfig::new(tsa_url)
+                .with_tsa_cert_path(tsa_cert_path)
+                .with_output_dir(output_dir.clone())
+                .with_verification(true);
+            
+            match timestamp::timestamp_file(&file, &config) {
+                Ok(result) => {
+                    if result.success {
+                        println!("  RFC 3161 timestamp created successfully");
+                        for f in &result.generated_files {
+                            println!("    - {}", f.display());
+                        }
+                        
+                        let new_tsr = output_dir.join(format!("{}.tsr", file_stem));
+                        let new_tsq = output_dir.join(format!("{}.tsq", file_stem));
+                        
+                        if new_tsr.exists() {
+                            rfc3161_tsr = Some(new_tsr);
+                        }
+                        if new_tsq.exists() {
+                            rfc3161_tsq = Some(new_tsq);
+                        }
+                    } else {
+                        warn!("RFC 3161 timestamp creation failed: {}", result.error.as_deref().unwrap_or("Unknown"));
+                    }
+                }
+                Err(e) => {
+                    warn!("RFC 3161 timestamp creation failed: {}", e);
+                }
+            }
+        }
+        println!();
+    }
+    
+    let create_blockchain = include_blockchain;
+    
+    if include_blockchain && !blockchain::check_ots_installed() {
+        if blockchain_only {
+            println!("OpenTimestamps client is not installed.");
+            println!("Install it with: pip3 install opentimestamps-client");
+            std::process::exit(1);
+        } else {
+            warn!("OpenTimestamps client not installed - skipping blockchain timestamp");
+            warn!("Install with: pip3 install opentimestamps-client");
+        }
+    }
+    
+    match blockchain::create_combined_proof_bundle(
+        &file,
+        rfc3161_tsr.as_deref(),
+        rfc3161_tsq.as_deref(),
+        create_blockchain && blockchain::check_ots_installed(),
+    ) {
         Ok(bundle) => {
             match blockchain::generate_proof_manifest(&bundle) {
                 Ok(manifest) => {
                     let output_path = output.unwrap_or_else(|| {
-                        PathBuf::from(format!("{}.proof-bundle.json", file.file_stem().unwrap().to_str().unwrap()))
+                        output_dir.join(format!("{}.proof-bundle.json", file_stem))
                     });
                     
                     std::fs::write(&output_path, &manifest)
                         .with_context(|| format!("Failed to write manifest to {}", output_path.display()))?;
                     
-                    println!("   Proof bundle manifest created: {}", output_path.display());
+                    println!("Proof bundle manifest created: {}", output_path.display());
                     println!();
                     println!("Bundle contents:");
+                    
+                    let mut has_content = false;
+                    
                     if bundle.rfc3161_tsr.is_some() {
-                        println!("   RFC 3161 timestamp (.tsr)");
+                        println!("  [RFC 3161] Timestamp response (.tsr)");
+                        has_content = true;
                     }
                     if bundle.rfc3161_tsq.is_some() {
-                        println!("   RFC 3161 query (.tsq)");
+                        println!("  [RFC 3161] Timestamp query (.tsq)");
+                        has_content = true;
+                    }
+                    if bundle.rfc3161_certs.is_some() {
+                        println!("  [RFC 3161] TSA certificates (.certs.pem)");
+                        has_content = true;
                     }
                     if bundle.ots_proof.is_some() {
-                        println!("   Blockchain proof (.ots)");
+                        println!("  [Blockchain] OpenTimestamps proof (.ots)");
+                        if let Some(ref status) = bundle.blockchain_status {
+                            println!("               Status: {}", status);
+                        }
+                        has_content = true;
                     }
+                    
+                    if !has_content {
+                        println!("  (No proof files found or created)");
+                    }
+                    
+                    println!();
+                    
+                    if include_rfc3161 && include_blockchain {
+                        println!("=== COMBINED PROOF CREATED ===");
+                        println!("Your document now has two independent proofs of existence:");
+                        println!("  1. RFC 3161 timestamp - legally recognized, immediate");
+                        println!("  2. Bitcoin blockchain - decentralized, permanent");
+                        if bundle.blockchain_status == Some(blockchain::BlockchainStatus::Pending) {
+                            println!();
+                            println!("Note: Bitcoin confirmation typically takes 1-24 hours.");
+                            println!("Run 'stamp blockchain upgrade <file>.ots' after confirmation.");
+                        }
+                    } else if include_rfc3161 {
+                        println!("=== RFC 3161 PROOF BUNDLE CREATED ===");
+                        println!("This bundle contains RFC 3161 timestamp proof.");
+                        println!("Legally recognized under eIDAS, ESIGN Act, and similar regulations.");
+                    } else if include_blockchain {
+                        println!("=== BLOCKCHAIN PROOF BUNDLE CREATED ===");
+                        println!("This bundle contains Bitcoin blockchain timestamp proof.");
+                        println!("Provides decentralized, immutable proof of existence.");
+                        if bundle.blockchain_status == Some(blockchain::BlockchainStatus::Pending) {
+                            println!();
+                            println!("Note: Bitcoin confirmation typically takes 1-24 hours.");
+                            println!("Run 'stamp blockchain upgrade <file>.ots' after confirmation.");
+                        }
+                    }
+                    
                     println!();
                     println!("Preserve all files listed in the manifest for legal evidence.");
                 }

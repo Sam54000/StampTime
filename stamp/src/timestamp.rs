@@ -141,17 +141,38 @@ pub fn generate_output_paths(input_file: &PathBuf, output_dir: &PathBuf, _timest
 
 pub fn create_timestamp_query(data: &[u8]) -> AnyhowResult<Vec<u8>> {
     use std::process::Command;
-    use tempfile::NamedTempFile;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::Builder;
     
-    let mut temp_file = NamedTempFile::new()
+    // Create temporary file with restrictive permissions (read/write for owner only)
+    let mut temp_file = Builder::new()
+        .prefix("stamp_tsq_")
+        .tempfile()
         .with_context(|| "Failed to create temporary file")?;
+    
+    // Set restrictive permissions
+    let mut perms = fs::metadata(temp_file.path())?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(temp_file.path(), perms)
+        .with_context(|| "Failed to set permissions on temporary file")?;
+    
     temp_file.write_all(data)
         .with_context(|| "Failed to write data to temporary file")?;
     temp_file.flush()
         .with_context(|| "Failed to flush temporary file")?;
     
-    let output_file = NamedTempFile::new()
+    // Create output temporary file with restrictive permissions
+    let output_file = Builder::new()
+        .prefix("stamp_tsq_out_")
+        .tempfile()
         .with_context(|| "Failed to create output temporary file")?;
+    
+    let mut output_perms = fs::metadata(output_file.path())?.permissions();
+    output_perms.set_mode(0o600);
+    fs::set_permissions(output_file.path(), output_perms)
+        .with_context(|| "Failed to set permissions on output temporary file")?;
+    
     let output_path = output_file.path().to_path_buf();
     drop(output_file);
     
@@ -178,30 +199,66 @@ pub fn create_timestamp_query(data: &[u8]) -> AnyhowResult<Vec<u8>> {
     let tsq_data = std::fs::read(&output_path)
         .with_context(|| "Failed to read generated timestamp query")?;
     
-    let _ = std::fs::remove_file(temp_file.path());
+    // Clean up temporary files immediately
+    drop(temp_file);
     let _ = std::fs::remove_file(&output_path);
     
     Ok(tsq_data)
 }
 
+/// Validate file path to prevent command injection
+pub fn validate_file_path(path: &std::path::Path) -> AnyhowResult<()> {
+    // Check for null bytes
+    if let Some(path_str) = path.to_str() {
+        if path_str.contains('\0') {
+            return Err(anyhow::anyhow!("File path contains null bytes"));
+        }
+        // Check for suspicious patterns that could be used for command injection
+        // Note: Rust's Command API handles most of this, but we add extra validation
+        if path_str.contains("$(") || path_str.contains("`") || path_str.contains(";") {
+            return Err(anyhow::anyhow!("File path contains potentially dangerous characters"));
+        }
+    }
+    Ok(())
+}
+
 pub fn extract_timestamp_certificates(tsr_data: &[u8]) -> AnyhowResult<Vec<String>> {
     use std::process::Command;
-    use tempfile::NamedTempFile;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::Builder;
     
-    let mut temp_tsr = NamedTempFile::new()
+    // Create temporary file with restrictive permissions
+    let mut temp_tsr = Builder::new()
+        .prefix("stamp_tsr_")
+        .tempfile()
         .with_context(|| "Failed to create temporary TSR file")?;
+    
+    // Set restrictive permissions
+    let mut perms = fs::metadata(temp_tsr.path())?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(temp_tsr.path(), perms)
+        .with_context(|| "Failed to set permissions on temporary TSR file")?;
+    
     temp_tsr.write_all(tsr_data)
         .with_context(|| "Failed to write TSR data to temporary file")?;
     temp_tsr.flush()
         .with_context(|| "Failed to flush temporary TSR file")?;
     
+    // Validate the path before using it
+    validate_file_path(temp_tsr.path())?;
+    
     // Extract embedded certificates from the timestamp response using PKCS7 extraction
     // This is the proper way to extract certificates for legal verification
     // First, extract the token (PKCS7 signed data) from the TSR
+    let tsr_path_str = temp_tsr.path().to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid path encoding"))?;
+    validate_file_path(temp_tsr.path())?;
+    
     let token_output = Command::new("openssl")
         .args(&[
             "ts", "-reply",
-            "-in", temp_tsr.path().to_str().unwrap(),
+            "-in", tsr_path_str,
             "-token_out"
         ])
         .output()
@@ -333,6 +390,7 @@ fn extract_pem_certificates(text: &str) -> AnyhowResult<Vec<String>> {
     Ok(certificates)
 }
 
+#[allow(dead_code)]
 pub fn verify_timestamp_response(tsr_data: &[u8], tsq_data: &[u8]) -> AnyhowResult<bool> {
     use std::process::Command;
     use tempfile::NamedTempFile;
@@ -470,7 +528,35 @@ pub fn verify_timestamp_response_files(
     }
 }
 
+/// Sanitize error messages to prevent information disclosure
+#[allow(dead_code)]
+fn sanitize_error_message(msg: &str) -> String {
+    // Remove absolute paths, replace with relative paths or generic names
+    let sanitized = msg
+        .lines()
+        .map(|line| {
+            // Replace common absolute path patterns
+            if line.contains("/home/") || line.contains("/Users/") || line.contains("C:\\") {
+                // Extract just the filename if possible
+                if let Some(filename) = line.split('/').last().or_else(|| line.split('\\').last()) {
+                    format!("[path redacted]/{}", filename)
+                } else {
+                    "[path redacted]".to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sanitized
+}
+
 pub fn send_timestamp_request(tsq_data: &[u8], tsa_url: &str) -> AnyhowResult<Vec<u8>> {
+    // Validate URL to prevent SSRF
+    crate::config::validate_url(tsa_url)
+        .map_err(|e| anyhow::anyhow!("Invalid TSA URL: {}", e))?;
+    
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -494,16 +580,17 @@ pub fn send_timestamp_request(tsq_data: &[u8], tsa_url: &str) -> AnyhowResult<Ve
     
     if !response.status().is_success() {
         let status = response.status();
-        let headers: std::collections::HashMap<String, String> = response.headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+        // Don't expose full headers or response body to users - log internally only
+        warn!("TSA request failed with status: {}", status);
+        warn!("Response headers: {:?}", response.headers());
         
         let response_text = response.text().unwrap_or_else(|_| "Could not read response body".to_string());
+        warn!("TSA response body: {}", response_text);
         
+        // Return sanitized error message to user
         return Err(anyhow::anyhow!(
-            "TSA request failed with status: {} - Headers: {:?} - Response: {}",
-            status, headers, response_text
+            "TSA request failed with status: {}. Check logs for details.",
+            status
         ));
     }
     
@@ -1149,7 +1236,9 @@ fn file_has_changed_since_timestamp(input_file: &std::path::Path, output_dir: &P
 
 /// Git-based change detection functions
 fn create_git_command() -> std::process::Command {
-    std::process::Command::new("/usr/bin/git")
+    // Use "git" and let the system find it via PATH instead of hardcoded path
+    // This works on all systems (Linux, macOS, Windows with Git installed)
+    std::process::Command::new("git")
 }
 
 /// Get git-deleted files (files that existed before but are now deleted)
@@ -2070,4 +2159,107 @@ fn parse_certificate_info(text: &str) -> AnyhowResult<std::collections::HashMap<
     }
     
     Ok(info)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_validate_file_path_rejects_null_bytes() {
+        let path = PathBuf::from("file\0with\0nulls.txt");
+        assert!(validate_file_path(&path).is_err());
+    }
+
+    #[test]
+    fn test_validate_file_path_rejects_command_injection_patterns() {
+        let test_cases = vec![
+            "file$(rm -rf /).txt",
+            "file`rm -rf /`.txt",
+            "file; rm -rf /; .txt",
+            "file$(whoami).txt",
+        ];
+        
+        for test_case in test_cases {
+            let path = PathBuf::from(test_case);
+            assert!(validate_file_path(&path).is_err(), "Should reject: {}", test_case);
+        }
+    }
+
+    #[test]
+    fn test_validate_file_path_accepts_valid_paths() {
+        let valid_paths = vec![
+            "document.pdf",
+            "file-name_123.txt",
+            "path/to/file.pdf",
+            "file with spaces.pdf",
+            "file-name.txt",
+            "123file.pdf",
+        ];
+        
+        for valid_path in valid_paths {
+            let path = PathBuf::from(valid_path);
+            assert!(validate_file_path(&path).is_ok(), "Should accept: {}", valid_path);
+        }
+    }
+
+    #[test]
+    fn test_validate_file_path_handles_unicode() {
+        let path = PathBuf::from("файл.pdf");
+        assert!(validate_file_path(&path).is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_path_handles_special_characters() {
+        let safe_special = vec![
+            "file-name.pdf",
+            "file_name.pdf",
+            "file.name.pdf",
+            "file+name.pdf",
+            "file=name.pdf",
+            "file@name.pdf",
+        ];
+        
+        for safe_path in safe_special {
+            let path = PathBuf::from(safe_path);
+            assert!(validate_file_path(&path).is_ok(), "Should accept: {}", safe_path);
+        }
+    }
+
+    #[test]
+    fn test_generate_output_paths_creates_valid_paths() {
+        let input = PathBuf::from("test.pdf");
+        let output = PathBuf::from("./output");
+        
+        let result = generate_output_paths(&input, &output, TimestampType::Rfc3161);
+        assert!(result.is_ok());
+        
+        let paths = result.unwrap();
+        assert_eq!(paths.timestamp_query, Some(output.join("test.tsq")));
+        assert_eq!(paths.timestamp_response, Some(output.join("test.tsr")));
+        assert_eq!(paths.timestamp_certs, Some(output.join("test.tsr.certs.pem")));
+    }
+
+    #[test]
+    fn test_generate_output_paths_handles_complex_filenames() {
+        let input = PathBuf::from("my-document_v2.1.pdf");
+        let output = PathBuf::from("./timestamps");
+        
+        let result = generate_output_paths(&input, &output, TimestampType::Rfc3161);
+        assert!(result.is_ok());
+        
+        let paths = result.unwrap();
+        assert_eq!(paths.timestamp_query, Some(output.join("my-document_v2.1.tsq")));
+    }
+
+    #[test]
+    fn test_generate_output_paths_rejects_invalid_filenames() {
+        let input = PathBuf::from(".");
+        let output = PathBuf::from("./output");
+        
+        let result = generate_output_paths(&input, &output, TimestampType::Rfc3161);
+        assert!(result.is_err());
+    }
 }
